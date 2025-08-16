@@ -739,7 +739,7 @@ When upgrading the package system:
 
 The GAL package system is open source and welcomes contributions:
 
-1. **Repository**: https://github.com/gal-lang/gal
+1. **Repository**: https://github.com/geeknik/gal
 2. **Issues**: Report bugs and feature requests
 3. **Pull Requests**: Submit improvements and fixes
 4. **Documentation**: Help improve documentation
