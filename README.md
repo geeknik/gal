@@ -81,7 +81,7 @@ actor ConsensusNode {
 
 ```bash
 # Install from source (requires Rust 1.70+)
-git clone https://github.com/gal-lang/gal
+git clone https://github.com/geeknik/gal
 cd gal
 cargo build --release
 
