@@ -33,7 +33,7 @@ Revolutionary documentation platform for the Gödelian Actor Language (GAL) feat
 
 ```bash
 # Clone the repository
-git clone https://github.com/gal-lang/gal.git
+git clone https://github.com/geeknik/gal.git
 cd gal/docs
 
 # Install dependencies
@@ -240,10 +240,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📞 Support
 
-- **Documentation**: [docs.gal-lang.org](https://docs.gal-lang.org)
-- **Issues**: [GitHub Issues](https://github.com/gal-lang/gal/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/gal-lang/gal/discussions)
-- **Discord**: [GAL Community](https://discord.gg/gal)
+- **Issues**: [GitHub Issues](https://github.com/geeknik/gal/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/geeknik/gal/discussions)
 
 ---
 
