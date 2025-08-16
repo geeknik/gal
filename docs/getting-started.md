@@ -15,7 +15,7 @@ Before you begin, ensure you have the following installed:
 
 ```bash
 # Clone the GAL repository
-git clone https://github.com/gal-lang/gal
+git clone https://github.com/geeknik/gal
 cd gal
 
 # Build the compiler
@@ -274,9 +274,8 @@ A: Ensure you have invariants defined. Chaos testing validates that invariants h
 
 If you encounter issues:
 1. Check the [FAQ](faq.md)
-2. Search [GitHub issues](https://github.com/gal-lang/gal/issues)
-3. Ask on [Discord](https://discord.gg/gal-lang)
-4. Report bugs on [GitHub](https://github.com/gal-lang/gal/issues/new)
+2. Search [GitHub issues](https://github.com/geeknik/gal/issues)
+3. Report bugs on [GitHub](https://github.com/geeknik/gal/issues/new)
 
 ## Summary
 
