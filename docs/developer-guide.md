@@ -31,7 +31,7 @@ Before you can build GAL from source, ensure you have:
 
 ```bash
 # Clone the repository
-git clone https://github.com/gal-lang/gal.git
+git clone https://github.com/geeknik/gal.git
 cd gal
 
 # Install development dependencies
