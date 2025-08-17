@@ -1,0 +1,292 @@
+//! # Self-Optimizing Cache Example
+//!
+//! This example demonstrates GAL's Gödelian meta-programming capabilities
+//! including self-modification, reflection, quines, and fixed-point computation.
+
+import std.collections.{LRU, LFU}
+import std.performance.{PerformanceMetrics, CacheMetrics}
+import gal.godel.{reflect, synthesize_actor, prove_equivalent, godel_number}
+import gal.fixpoint.{fixed_point, Y}
+
+// Self-optimizing cache that modifies its own behavior based on performance
+@godel_self_modify
+@chaos_invariant("hit_rate_improvement")
+actor SelfOptimizingCache {
+    state strategy: CacheStrategy = LRU(capacity: 1000)
+    state performance: PerformanceMetrics = PerformanceMetrics.new()
+    state optimization_history: Vec<OptimizationEvent> = []
+    state godel_number: Int = 0
+    
+    // Initialize with self-awareness
+    new() =>
+        let self_code = reflect(self)
+        godel_number = godel_number(self_code)
+        log.info("Initialized with Gödel number: {}", godel_number)
+    
+    // Main cache operations
+    on Get(key: String) =>
+        let start_time = now()
+        let value = strategy.get(key)
+        let duration = now() - start_time
+        
+        performance.record_access(key, value.is_some(), duration)
+        
+        // Trigger self-optimization if performance degrades
+        if performance.needs_optimization() {
+            send(self, Optimize())
+        }
+        
+        reply(value)
+    
+    on Put(key: String, value: Any) =>
+        let start_time = now()
+        strategy.put(key, value)
+        let duration = now() - start_time
+        
+        performance.record_insertion(key, value, duration)
+    
+    // Self-optimization using Gödelian techniques
+    @godel_self_modify
+    on Optimize() =>
+        log.info("Starting self-optimization...")
+        
+        let current_code = reflect(self)
+        let metrics = performance.current_metrics()
+        
+        // Use fixed-point computation to find optimal strategy
+        let optimal_strategy = fixed_point(
+            lambda(strategy) => analyze_strategy_performance(strategy, metrics),
+            strategy: "tarski"
+        )
+        
+        // Generate optimized version using synthesis
+        let optimized = synthesize_actor {
+            base: current_code,
+            constraints: [
+                maintain_correctness(),
+                preserve_api_compatibility(),
+                improve_hit_rate()
+            ],
+            objective: maximize(hit_rate) - minimize(memory_usage)
+        }
+        
+        // Prove equivalence before hot-swapping
+        if prove_equivalent(current_code, optimized) {
+            log.info("Equivalence proven, applying optimization...")
+            
+            // Record the optimization event
+            let event = OptimizationEvent {
+                timestamp: now(),
+                old_godel_number: godel_number,
+                new_godel_number: godel_number(optimized),
+                improvement_factor: calculate_improvement(metrics),
+                proof: Some("Functional equivalence proven via bisimulation")
+            }
+            optimization_history.push(event)
+            
+            // Perform hot-swap
+            hot_swap(optimized)
+            
+            // Update our Gödel number
+            godel_number = godel_number(reflect(self))
+            
+            reply(OptimizationComplete(event))
+        } else {
+            log.warning("Could not prove equivalence, optimization cancelled")
+            reply(OptimizationFailed("Equivalence proof failed"))
+        }
+    
+    // Meta-programming introspection
+    on GetSelfReference() =>
+        let self_code = reflect(self)
+        let is_self_reproducing = is_quine(self_code)
+        
+        reply(SelfReference {
+            code: self_code,
+            godel_number: godel_number,
+            is_quine: is_self_reproducing,
+            optimization_count: optimization_history.len(),
+            current_performance: performance.current_metrics()
+        })
+    
+    // Create a quine variant that reproduces itself
+    on CreateQuine() =>
+        let quine_code = quote {
+            actor QuineCache {
+                state self_code: String = "SELF_REFERENCE"
+                
+                on Reproduce() =>
+                    reply(self_code.replace("SELF_REFERENCE", self_code))
+            }
+        }
+        
+        // Verify it's actually a quine
+        if is_quine(quine_code) {
+            reply(QuineGenerated(quine_code))
+        } else {
+            reply(QuineGenerationFailed("Generated code is not self-reproducing"))
+        }
+    
+    // Y combinator demonstration for recursive optimization
+    on RecursiveOptimize() =>
+        let recursive_optimizer = Y(lambda(optimize) => lambda(current_state) => {
+            if is_optimal(current_state) {
+                current_state
+            } else {
+                let improved = apply_optimization_step(current_state)
+                optimize(improved)
+            }
+        })
+        
+        let final_state = recursive_optimizer(performance.current_state())
+        strategy = final_state.strategy
+        reply(RecursiveOptimizationComplete(final_state))
+    
+    // Analysis and helper functions
+    fn maintain_correctness() -> Constraint {
+        Constraint::PreserveSemantics([
+            "get(key) returns same value for same key within session",
+            "put(key, value) makes value retrievable via get(key)",
+            "cache capacity limits are respected"
+        ])
+    }
+    
+    fn preserve_api_compatibility() -> Constraint {
+        Constraint::PreserveInterface([
+            "Get(String) -> Option<Any>",
+            "Put(String, Any) -> Unit",
+            "Optimize() -> OptimizationResult"
+        ])
+    }
+    
+    fn improve_hit_rate() -> Constraint {
+        Constraint::PerformanceImprovement(
+            metric: "hit_rate",
+            minimum_improvement: 0.05
+        )
+    }
+    
+    fn analyze_strategy_performance(strategy: CacheStrategy, metrics: PerformanceMetrics) -> Float {
+        let hit_rate_score = metrics.hit_rate * 0.6
+        let memory_efficiency = (1.0 - metrics.memory_utilization) * 0.3
+        let latency_score = (1.0 / metrics.avg_access_time) * 0.1
+        
+        hit_rate_score + memory_efficiency + latency_score
+    }
+    
+    fn calculate_improvement(old_metrics: PerformanceMetrics) -> Float {
+        let new_metrics = performance.current_metrics()
+        
+        let hit_rate_improvement = (new_metrics.hit_rate - old_metrics.hit_rate) / old_metrics.hit_rate
+        let latency_improvement = (old_metrics.avg_latency - new_metrics.avg_latency) / old_metrics.avg_latency
+        
+        (hit_rate_improvement + latency_improvement) / 2.0
+    }
+    
+    fn is_optimal(state: CacheState) -> Bool {
+        state.hit_rate > 0.95 && state.memory_utilization < 0.8
+    }
+    
+    fn apply_optimization_step(state: CacheState) -> CacheState {
+        // Apply one step of optimization
+        if state.hit_rate < 0.7 {
+            state.with_strategy(LFU(capacity: state.capacity))
+        } else if state.memory_utilization > 0.9 {
+            state.with_capacity(state.capacity * 0.8)
+        } else {
+            state.with_strategy(adaptiveStrategy(state.access_pattern))
+        }
+    }
+}
+
+// Data structures for the self-optimizing cache
+type OptimizationEvent = {
+    timestamp: Timestamp,
+    old_godel_number: Int,
+    new_godel_number: Int,
+    improvement_factor: Float,
+    proof: Option<String>
+}
+
+type SelfReference = {
+    code: CodeRepresentation,
+    godel_number: Int,
+    is_quine: Bool,
+    optimization_count: Int,
+    current_performance: PerformanceMetrics
+}
+
+type CacheState = {
+    strategy: CacheStrategy,
+    capacity: Int,
+    hit_rate: Float,
+    memory_utilization: Float,
+    access_pattern: AccessPattern
+}
+
+// Example usage and testing
+actor CacheController {
+    state cache: SelfOptimizingCache = spawn SelfOptimizingCache()
+    
+    on RunOptimizationDemo() =>
+        log.info("=== Gödelian Self-Optimization Demo ===")
+        
+        // 1. Basic cache operations
+        send(cache, Put("key1", "value1"))
+        send(cache, Put("key2", "value2"))
+        let result1 = await send(cache, Get("key1"))
+        let result2 = await send(cache, Get("nonexistent"))
+        
+        // 2. Get self-reference information
+        let self_ref = await send(cache, GetSelfReference())
+        log.info("Cache Gödel number: {}", self_ref.godel_number)
+        log.info("Is quine: {}", self_ref.is_quine)
+        
+        // 3. Trigger optimization
+        let opt_result = await send(cache, Optimize())
+        log.info("Optimization result: {:?}", opt_result)
+        
+        // 4. Create and verify quine
+        let quine_result = await send(cache, CreateQuine())
+        log.info("Quine generation: {:?}", quine_result)
+        
+        // 5. Demonstrate recursive optimization
+        let recursive_result = await send(cache, RecursiveOptimize())
+        log.info("Recursive optimization: {:?}", recursive_result)
+        
+        // 6. Final self-reference check
+        let final_ref = await send(cache, GetSelfReference())
+        log.info("Final Gödel number: {}", final_ref.godel_number)
+        log.info("Optimization count: {}", final_ref.optimization_count)
+        
+        reply(DemoComplete {
+            initial_godel: self_ref.godel_number,
+            final_godel: final_ref.godel_number,
+            optimizations_applied: final_ref.optimization_count
+        })
+}
+
+// Chaos testing with Gödelian properties
+@chaos_property_test
+fn test_self_optimization_under_faults() {
+    property godel_invariant_under_chaos {
+        given cache: SelfOptimizingCache = spawn SelfOptimizingCache()
+        given faults: ChaosSchedule = arbitrary_network_faults()
+        
+        when {
+            let initial_godel = godel_number(reflect(cache))
+            chaos.apply_schedule(faults)
+            send(cache, Optimize())
+            let final_godel = godel_number(reflect(cache))
+        }
+        
+        then {
+            // The cache should remain functionally equivalent even after optimization
+            prove_equivalent(initial_code, final_code) &&
+            // Performance should improve or stay the same
+            final_performance >= initial_performance &&
+            // Gödel number change indicates successful optimization
+            (final_godel != initial_godel) implies optimization_occurred
+        }
+    }
+}

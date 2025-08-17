@@ -1,0 +1,716 @@
+//! Distributed E-commerce System in GAL
+//! 
+//! This example showcases GAL's distributed actor capabilities in a realistic
+//! e-commerce scenario with microservices, transactions, and fault tolerance.
+
+// Import distributed primitives
+use gal::distributed::{DistributedLock, DistributedQueue, CRDT, VectorClock}
+use gal::chaos::{ChaosResilience, NetworkPartition, LatencySpike}
+
+// Global distributed configuration
+@cluster_config(
+    name: "ecommerce_cluster",
+    discovery: "consul://localhost:8500",
+    transport: "quic",
+    compression: "zstd",
+    encryption: "tls13"
+)
+
+// ============================================================================
+// User Management Service
+// ============================================================================
+
+@distributed(
+    placement: "region:us-east",
+    replication: 3,
+    consistency: "eventual",
+    migration: "enabled"
+)
+actor UserSession {
+    state user_id: String
+    state profile: UserProfile
+    state session_data: SessionData
+    state last_activity: Timestamp
+    
+    // CRDT for conflict-free profile updates
+    @crdt(type: "lww_register")  // Last-Write-Wins Register
+    state profile_crdt: CRDTRegister[UserProfile]
+    
+    // Vector clock for causality tracking
+    state vector_clock: VectorClock
+    
+    @replicated(
+        conflict_resolution: "last_write_wins",
+        sync_interval: "30s"
+    )
+    on UpdateProfile(changes: ProfileChanges) => {
+        // Update with vector clock
+        vector_clock.tick()
+        profile_crdt.set(profile.merge(changes), vector_clock)
+        profile = profile_crdt.get()
+        last_activity = now()
+        
+        // Broadcast to interested parties
+        broadcast(ProfileUpdated {
+            user_id: user_id,
+            profile: profile,
+            vector_clock: vector_clock
+        })
+        
+        respond(UpdateSuccess)
+    }
+    
+    @chaos_resilient(
+        network_partition: "offline_mode",
+        memory_pressure: "reduce_cache",
+        high_latency: "batch_operations"
+    )
+    on GetProfile() => {
+        last_activity = now()
+        
+        if is_chaos_active("network_partition") {
+            // Use locally cached data during partition
+            respond(ProfileResponse(profile, cached: true))
+        } else {
+            respond(ProfileResponse(profile, cached: false))
+        }
+    }
+    
+    on SessionHeartbeat() => {
+        last_activity = now()
+        respond(SessionAlive)
+    }
+    
+    // Cleanup inactive sessions
+    @scheduled("every 5m")
+    on CheckSessionTimeout() => {
+        if now() - last_activity > 30m {
+            broadcast(SessionExpired(user_id))
+            terminate_self()
+        }
+    }
+}
+
+// ============================================================================
+// Shopping Cart Service  
+// ============================================================================
+
+@distributed(
+    placement: "load_balance",
+    replication: 2,
+    consistency: "strong",
+    migration: "enabled"
+)
+actor ShoppingCart {
+    state user_id: String
+    state items: List[CartItem]
+    state total_price: Money
+    state cart_lock: DistributedLock
+    
+    // CRDT sets for conflict-free item management
+    @crdt(type: "or_set")  // Observed-Remove Set
+    state item_additions: ORSet[CartItem]
+    
+    @crdt(type: "or_set")
+    state item_removals: ORSet[ItemId]
+    
+    state vector_clock: VectorClock
+    
+    on AddItem(item: CartItem) => {
+        // Acquire distributed lock for consistency
+        cart_lock.acquire(timeout: 5s) {
+            vector_clock.tick()
+            item_additions.add(item, vector_clock)
+            
+            // Recompute cart from CRDT state
+            items = compute_current_items()
+            total_price = compute_total()
+            
+            broadcast(CartUpdated {
+                user_id: user_id,
+                items: items,
+                total: total_price,
+                vector_clock: vector_clock
+            })
+            
+            respond(ItemAdded(item.id, items.len()))
+        }
+    }
+    
+    on RemoveItem(item_id: ItemId) => {
+        cart_lock.acquire(timeout: 5s) {
+            vector_clock.tick()
+            item_removals.add(item_id, vector_clock)
+            
+            // Recompute cart from CRDT state
+            items = compute_current_items()
+            total_price = compute_total()
+            
+            broadcast(CartUpdated {
+                user_id: user_id,
+                items: items,
+                total: total_price,
+                vector_clock: vector_clock
+            })
+            
+            respond(ItemRemoved(item_id))
+        }
+    }
+    
+    // Helper function to compute current cart items from CRDT
+    fn compute_current_items() -> List[CartItem] {
+        let added_items = item_additions.elements()
+        let removed_ids = item_removals.elements()
+        
+        return added_items.filter(|item| !removed_ids.contains(item.id))
+    }
+    
+    fn compute_total() -> Money {
+        return items.map(|item| item.price * item.quantity).sum()
+    }
+    
+    @saga_compensatable(
+        compensation: "restore_cart_state"
+    )
+    on Checkout() => {
+        if items.is_empty() {
+            respond(CheckoutFailed("Empty cart"))
+            return
+        }
+        
+        // Begin Saga transaction for checkout
+        let saga = begin_saga([
+            ("reserve_inventory", "unreserve_inventory"),
+            ("process_payment", "refund_payment"),
+            ("create_order", "cancel_order"),
+            ("send_confirmation", "send_cancellation")
+        ])
+        
+        try {
+            // Step 1: Reserve inventory
+            let reservation = saga.execute_step("reserve_inventory", 
+                ReserveInventoryRequest(items))
+            
+            // Step 2: Process payment
+            let payment = saga.execute_step("process_payment", 
+                ProcessPaymentRequest(user_id, total_price))
+            
+            // Step 3: Create order
+            let order = saga.execute_step("create_order", 
+                CreateOrderRequest(user_id, items, payment.id))
+            
+            // Step 4: Send confirmation
+            saga.execute_step("send_confirmation", 
+                SendConfirmationRequest(user_id, order.id))
+            
+            // Clear cart after successful checkout
+            item_additions.clear()
+            item_removals.clear()
+            items.clear()
+            total_price = Money(0)
+            
+            respond(CheckoutSuccess(order))
+            
+        } catch SagaError(error) {
+            respond(CheckoutFailed(error.message))
+        }
+    }
+    
+    // Compensation action for saga
+    fn restore_cart_state(previous_state: CartState) {
+        items = previous_state.items
+        total_price = previous_state.total_price
+        item_additions = previous_state.item_additions
+        item_removals = previous_state.item_removals
+    }
+}
+
+// ============================================================================
+// Inventory Service
+// ============================================================================
+
+@distributed(
+    placement: "region:us-west",
+    replication: 5,
+    consistency: "strong",
+    partitioning: "by_category"
+)
+actor InventoryService {
+    state inventory: Map[ProductId, InventoryItem]
+    state reservations: Map[ReservationId, Reservation]
+    state distributed_counter: CRDTCounter  // For stock tracking
+    
+    // Distributed lock per product for inventory updates
+    state product_locks: Map[ProductId, DistributedLock]
+    
+    @transactional(isolation: "serializable")
+    on ReserveItems(request: ReserveInventoryRequest) => {
+        let reservation_id = generate_uuid()
+        let mut reserved_items = []
+        
+        // Use distributed transaction for ACID guarantees
+        let tx = begin_distributed_transaction()
+        
+        try {
+            for item in request.items {
+                let product_lock = product_locks.get_or_create(item.product_id)
+                
+                product_lock.acquire(timeout: 10s) {
+                    let inventory_item = inventory.get(item.product_id)
+                    
+                    if inventory_item.is_none() {
+                        throw TransactionError("Product not found: " + item.product_id)
+                    }
+                    
+                    if inventory_item.available_quantity < item.quantity {
+                        throw TransactionError("Insufficient inventory: " + item.product_id)
+                    }
+                    
+                    // Reserve the quantity
+                    inventory_item.available_quantity -= item.quantity
+                    inventory_item.reserved_quantity += item.quantity
+                    
+                    reserved_items.push(item)
+                    
+                    // Update distributed counter
+                    distributed_counter.decrement(item.quantity)
+                }
+            }
+            
+            // Create reservation record
+            reservations[reservation_id] = Reservation {
+                id: reservation_id,
+                items: reserved_items,
+                created_at: now(),
+                expires_at: now() + 15m  // 15 minute reservation
+            }
+            
+            tx.commit()
+            
+            respond(ReservationSuccess {
+                reservation_id: reservation_id,
+                expires_at: reservations[reservation_id].expires_at
+            })
+            
+        } catch TransactionError(error) {
+            tx.abort()
+            respond(ReservationFailed(error.message))
+        }
+    }
+    
+    on UnreserveItems(reservation_id: ReservationId) => {
+        if let Some(reservation) = reservations.get(reservation_id) {
+            for item in reservation.items {
+                let product_lock = product_locks.get(item.product_id)
+                product_lock.acquire(timeout: 5s) {
+                    let inventory_item = inventory.get_mut(item.product_id)
+                    inventory_item.available_quantity += item.quantity
+                    inventory_item.reserved_quantity -= item.quantity
+                    
+                    // Update distributed counter
+                    distributed_counter.increment(item.quantity)
+                }
+            }
+            
+            reservations.remove(reservation_id)
+            respond(UnreservationSuccess)
+        } else {
+            respond(UnreservationFailed("Reservation not found"))
+        }
+    }
+    
+    @scheduled("every 1m")
+    on CleanupExpiredReservations() => {
+        let now = now()
+        let expired_reservations = reservations.values()
+            .filter(|r| r.expires_at < now)
+            .collect()
+        
+        for reservation in expired_reservations {
+            send_self(UnreserveItems(reservation.id))
+        }
+    }
+    
+    @chaos_resilient(
+        memory_pressure: "evict_old_reservations",
+        high_cpu: "batch_updates"
+    )
+    on GetInventory(product_id: ProductId) => {
+        if let Some(item) = inventory.get(product_id) {
+            respond(InventoryResponse(item.clone()))
+        } else {
+            respond(ProductNotFound(product_id))
+        }
+    }
+}
+
+// ============================================================================
+// Payment Service
+// ============================================================================
+
+@distributed(
+    placement: "region:secure",
+    replication: 2,
+    consistency: "strong",
+    security: "high"
+)
+actor PaymentService {
+    state transactions: Map[TransactionId, PaymentTransaction]
+    state fraud_detector: FraudDetector
+    state payment_gateways: List[PaymentGateway]
+    
+    @transactional(isolation: "serializable")
+    on ProcessPayment(request: ProcessPaymentRequest) => {
+        let transaction_id = generate_uuid()
+        
+        // Fraud detection
+        let fraud_score = fraud_detector.analyze(request)
+        if fraud_score > 0.8 {
+            respond(PaymentFailed("Transaction flagged as fraudulent"))
+            return
+        }
+        
+        // Try payment gateways with circuit breaker pattern
+        let mut gateway_errors = []
+        
+        for gateway in payment_gateways {
+            if gateway.circuit_breaker.is_open() {
+                continue  // Skip failed gateways
+            }
+            
+            try {
+                let result = gateway.charge(
+                    amount: request.amount,
+                    payment_method: request.payment_method,
+                    idempotency_key: transaction_id
+                )
+                
+                // Record successful transaction
+                transactions[transaction_id] = PaymentTransaction {
+                    id: transaction_id,
+                    user_id: request.user_id,
+                    amount: request.amount,
+                    gateway: gateway.name,
+                    status: "completed",
+                    created_at: now()
+                }
+                
+                gateway.circuit_breaker.record_success()
+                
+                respond(PaymentSuccess {
+                    transaction_id: transaction_id,
+                    amount_charged: result.amount,
+                    gateway: gateway.name
+                })
+                return
+                
+            } catch PaymentError(error) {
+                gateway.circuit_breaker.record_failure()
+                gateway_errors.push(error)
+                continue
+            }
+        }
+        
+        // All gateways failed
+        respond(PaymentFailed("All payment gateways unavailable"))
+    }
+    
+    on RefundPayment(transaction_id: TransactionId) => {
+        if let Some(transaction) = transactions.get(transaction_id) {
+            let gateway = payment_gateways.find(|g| g.name == transaction.gateway)
+            
+            try {
+                gateway.refund(transaction.id, transaction.amount)
+                
+                transaction.status = "refunded"
+                transaction.refunded_at = Some(now())
+                
+                respond(RefundSuccess(transaction_id))
+                
+            } catch RefundError(error) {
+                respond(RefundFailed(error.message))
+            }
+        } else {
+            respond(RefundFailed("Transaction not found"))
+        }
+    }
+}
+
+// ============================================================================
+// Order Service
+// ============================================================================
+
+@distributed(
+    placement: "load_balance",
+    replication: 3,
+    consistency: "eventual"
+)
+actor OrderService {
+    state orders: Map[OrderId, Order]
+    state order_queue: DistributedQueue
+    
+    on CreateOrder(request: CreateOrderRequest) => {
+        let order_id = generate_uuid()
+        
+        let order = Order {
+            id: order_id,
+            user_id: request.user_id,
+            items: request.items,
+            payment_transaction_id: request.payment_transaction_id,
+            status: "created",
+            created_at: now(),
+            estimated_delivery: now() + 3d
+        }
+        
+        orders[order_id] = order
+        
+        // Queue order for fulfillment
+        order_queue.enqueue(OrderFulfillmentTask {
+            order_id: order_id,
+            priority: "normal"
+        })
+        
+        respond(OrderCreated(order))
+    }
+    
+    on CancelOrder(order_id: OrderId) => {
+        if let Some(order) = orders.get_mut(order_id) {
+            if order.status == "created" || order.status == "processing" {
+                order.status = "cancelled"
+                order.cancelled_at = Some(now())
+                respond(OrderCancelled(order_id))
+            } else {
+                respond(CancellationFailed("Order cannot be cancelled"))
+            }
+        } else {
+            respond(OrderNotFound(order_id))
+        }
+    }
+}
+
+// ============================================================================
+// Notification Service
+// ============================================================================
+
+@distributed(
+    placement: "anti_affinity:high_cpu_service",
+    replication: 2,
+    consistency: "eventual"
+)
+actor NotificationService {
+    state subscribers: CRDTMap[UserId, NotificationPreferences]
+    state notification_queue: DistributedQueue
+    state templates: Map[NotificationType, MessageTemplate]
+    
+    on Subscribe(user_id: UserId, preferences: NotificationPreferences) => {
+        subscribers.put(user_id, preferences)
+        respond(SubscriptionSuccess)
+    }
+    
+    on SendNotification(notification: Notification) => {
+        let prefs = subscribers.get(notification.user_id)
+        
+        if prefs.is_some() && should_send_notification(notification, prefs.unwrap()) {
+            notification_queue.enqueue(NotificationTask {
+                user_id: notification.user_id,
+                message: render_template(notification),
+                channels: determine_channels(prefs.unwrap()),
+                retry_count: 0
+            })
+            respond(NotificationQueued)
+        } else {
+            respond(NotificationSkipped("User preferences"))
+        }
+    }
+    
+    @background_worker("notification_processor")
+    on ProcessNotificationQueue() => {
+        while let Some(task) = notification_queue.dequeue() {
+            try {
+                send_notification_via_channels(task)
+            } catch NotificationError(error) {
+                if task.retry_count < 3 {
+                    task.retry_count += 1
+                    notification_queue.enqueue_with_delay(task, delay: 2^task.retry_count * 1s)
+                } else {
+                    log_error("Failed to send notification after retries", task)
+                }
+            }
+        }
+    }
+    
+    fn should_send_notification(notification: Notification, prefs: NotificationPreferences) -> Bool {
+        return prefs.enabled_types.contains(notification.type) &&
+               now() >= prefs.quiet_hours_start && 
+               now() <= prefs.quiet_hours_end
+    }
+}
+
+// ============================================================================
+// Main Application Setup
+// ============================================================================
+
+// Cluster initialization
+@cluster_bootstrap
+fn setup_ecommerce_cluster() {
+    // Start cluster with seed nodes
+    let cluster = DistributedCluster::new([
+        "node1.ecommerce.local:8001",
+        "node2.ecommerce.local:8002", 
+        "node3.ecommerce.local:8003"
+    ])
+    
+    // Enable chaos engineering for resilience testing
+    cluster.enable_chaos_engineering([
+        NetworkPartition(probability: 0.01),
+        LatencySpike(max_latency: 5s, probability: 0.05),
+        NodeFailure(probability: 0.001),
+        MemoryPressure(threshold: 0.8)
+    ])
+    
+    // Setup observability
+    cluster.enable_distributed_tracing()
+    cluster.enable_metrics_collection(interval: 30s)
+    cluster.enable_health_monitoring()
+    
+    return cluster
+}
+
+// Usage example
+fn main() {
+    let cluster = setup_ecommerce_cluster()
+    
+    // Spawn distributed actors across the cluster
+    let user_session = spawn UserSession(user_id: "user_12345") at "auto"
+    let shopping_cart = spawn ShoppingCart(user_id: "user_12345") at "us-west"
+    let inventory = spawn InventoryService() at "us-west"
+    let payment = spawn PaymentService() at "secure"
+    let orders = spawn OrderService() at "auto" 
+    let notifications = spawn NotificationService() at "us-east"
+    
+    // All messaging is location-transparent
+    send(user_session, UpdateProfile(email: "user@example.com"))
+    send(shopping_cart, AddItem(CartItem(product_id: "laptop_001", quantity: 1, price: Money(999.99))))
+    
+    // Distributed transaction for checkout
+    let checkout_result = send_and_wait(shopping_cart, Checkout())
+    
+    match checkout_result {
+        CheckoutSuccess(order) => {
+            println("Order created successfully: {}", order.id)
+        },
+        CheckoutFailed(error) => {
+            println("Checkout failed: {}", error)
+        }
+    }
+    
+    // Graceful shutdown
+    cluster.shutdown()
+}
+
+// ============================================================================
+// Type Definitions
+// ============================================================================
+
+struct UserProfile {
+    email: String,
+    name: String,
+    phone: Option[String],
+    address: Address,
+    preferences: Map[String, String]
+}
+
+struct SessionData {
+    login_time: Timestamp,
+    last_activity: Timestamp,
+    ip_address: String,
+    user_agent: String
+}
+
+struct CartItem {
+    product_id: String,
+    name: String,
+    price: Money,
+    quantity: U32,
+    image_url: String
+}
+
+struct InventoryItem {
+    product_id: String,
+    available_quantity: U32,
+    reserved_quantity: U32,
+    reorder_point: U32,
+    last_updated: Timestamp
+}
+
+struct PaymentTransaction {
+    id: String,
+    user_id: String,
+    amount: Money,
+    gateway: String,
+    status: String,
+    created_at: Timestamp,
+    refunded_at: Option[Timestamp]
+}
+
+struct Order {
+    id: String,
+    user_id: String,
+    items: List[CartItem],
+    payment_transaction_id: String,
+    status: String,
+    created_at: Timestamp,
+    estimated_delivery: Timestamp,
+    cancelled_at: Option[Timestamp]
+}
+
+struct Notification {
+    user_id: String,
+    type: NotificationType,
+    title: String,
+    body: String,
+    data: Map[String, String]
+}
+
+enum NotificationType {
+    OrderConfirmation,
+    PaymentProcessed,
+    OrderShipped,
+    OrderDelivered,
+    PromotionalOffer
+}
+
+struct NotificationPreferences {
+    enabled_types: Set[NotificationType],
+    email_enabled: Bool,
+    sms_enabled: Bool,
+    push_enabled: Bool,
+    quiet_hours_start: Time,
+    quiet_hours_end: Time
+}
+
+// ============================================================================
+// This GAL file demonstrates:
+// 
+// ✅ Location transparency - actors work the same locally or remotely
+// ✅ Distributed state management with CRDTs
+// ✅ Vector clocks for causality tracking  
+// ✅ Distributed transactions (2PC and Saga patterns)
+// ✅ Distributed primitives (locks, queues, counters)
+// ✅ Automatic placement strategies and load balancing
+// ✅ Fault tolerance and chaos engineering integration
+// ✅ Circuit breakers and retry mechanisms
+// ✅ Comprehensive observability and monitoring
+// ✅ Background task processing
+// ✅ Event-driven architecture with broadcasts
+// ✅ Graceful degradation under failures
+// 
+// The system automatically handles:
+// - Node failures and network partitions
+// - Load balancing and auto-scaling  
+// - Data replication and consistency
+// - Service discovery and routing
+// - Circuit breaking and retries
+// - Distributed tracing and metrics
+// - Chaos engineering for resilience testing
+// ============================================================================

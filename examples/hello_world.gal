@@ -1,0 +1,19 @@
+// Hello World in GAL - demonstrates basic actor messaging
+
+actor Greeter {
+    state greeting: String = "Hello"
+    
+    new create(message: String) =>
+        greeting = message
+        
+    on "greet" =>
+        println(greeting + ", World!")
+        println("My source code:")
+        println(reflect(self))
+}
+
+actor Main {
+    new create() =>
+        let greeter = spawn Greeter("Greetings")
+        send(greeter, "greet")
+}

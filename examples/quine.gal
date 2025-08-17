@@ -1,0 +1,39 @@
+// Gödelian Quine Actor - demonstrates self-reference and reflection
+
+actor QuineActor {
+    state iterations: Int = 0
+    
+    new create() =>
+        println("I am a self-referential actor!")
+        send(self, "print_self")
+        
+    on "print_self" =>
+        iterations = iterations + 1
+        println("--- Iteration " + iterations + " ---")
+        println("My source code is:")
+        println(reflect(self))
+        println("--- End of source ---")
+        
+        if iterations < 3 then
+            println("Recursively printing myself again...")
+            send(self, "print_self")
+        else
+            println("That's enough self-reflection for now!")
+}
+
+// A function that returns its own definition
+fun self_describing() -> String {
+    reflect(self_describing)
+}
+
+actor Main {
+    new create() =>
+        println("Welcome to the Gödelian Quine!")
+        println("This demonstrates self-reference in GAL")
+        println()
+        
+        let quine = spawn QuineActor()
+        
+        println("Here's a self-describing function:")
+        println(self_describing())
+}

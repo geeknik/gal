@@ -1,0 +1,37 @@
+// Counter Actor - demonstrates state management and recursion
+
+actor Counter {
+    state count: Int = 0
+    state max_count: Int = 5
+    
+    new create(max: Int) =>
+        max_count = max
+        send(self, "start")
+        
+    on "start" =>
+        count = 0
+        send(self, "increment")
+        
+    on "increment" =>
+        count = count + 1
+        println("Count: " + count)
+        
+        if count < max_count then
+            send(self, "increment")
+        else
+            println("Counting complete!")
+            println("Final count: " + count)
+            
+    on "reset" =>
+        count = 0
+        println("Counter reset")
+        
+    on "get_count" =>
+        println("Current count: " + count)
+}
+
+actor Main {
+    new create() =>
+        let counter = spawn Counter(10)
+        // Counter will start automatically
+}

@@ -1,0 +1,480 @@
+// MapReduce Implementation in GAL
+// Demonstrates: distributed computation, actor pools, aggregation
+
+use stdlib::*
+
+// Generic MapReduce types
+type MapInput<K, V> = {key: K, value: V}
+type MapOutput<K2, V2> = {key: K2, value: V2}
+type ReduceInput<K2, V2> = {key: K2, values: Array<V2>}
+type ReduceOutput<K2, V3> = {key: K2, value: V3}
+
+// Mapper actor - processes input chunks
+actor Mapper<K, V, K2, V2> {
+    state id: String
+    state map_function: fun(K, V) -> Array<MapOutput<K2, V2>>
+    state processed_count: Int
+    
+    new create(mapper_id: String, map_fn: fun(K, V) -> Array<MapOutput<K2, V2>>) {
+        id = mapper_id
+        map_function = map_fn
+        processed_count = 0
+    }
+    
+    on ProcessChunk(inputs: Array<MapInput<K, V>>) {
+        let results = []
+        
+        for input in inputs {
+            let mapped = map_function(input.key, input.value)
+            for output in mapped {
+                results.push(output)
+            }
+            processed_count = processed_count + 1
+        }
+        
+        reply(results)
+    }
+    
+    on GetStats() {
+        reply({
+            mapper_id: id,
+            processed: processed_count
+        })
+    }
+}
+
+// Reducer actor - aggregates mapped values
+actor Reducer<K2, V2, V3> {
+    state id: String
+    state reduce_function: fun(K2, Array<V2>) -> V3
+    state processed_count: Int
+    
+    new create(reducer_id: String, reduce_fn: fun(K2, Array<V2>) -> V3) {
+        id = reducer_id
+        reduce_function = reduce_fn
+        processed_count = 0
+    }
+    
+    on ProcessGroup(input: ReduceInput<K2, V2>) {
+        let result = reduce_function(input.key, input.values)
+        processed_count = processed_count + 1
+        
+        reply(ReduceOutput<K2, V3> {
+            key: input.key,
+            value: result
+        })
+    }
+    
+    on GetStats() {
+        reply({
+            reducer_id: id,
+            processed: processed_count
+        })
+    }
+}
+
+// Shuffler - groups map outputs by key for reducers
+actor Shuffler<K2, V2> {
+    state intermediate_data: HashMap<K2, Array<V2>>
+    state partition_count: Int
+    
+    new create(partitions: Int) {
+        intermediate_data = HashMap::new()
+        partition_count = partitions
+    }
+    
+    on AddMapOutput(outputs: Array<MapOutput<K2, V2>>) {
+        for output in outputs {
+            if !intermediate_data.contains(output.key) {
+                intermediate_data.put(output.key, [])
+            }
+            let values = intermediate_data.get(output.key)
+            values.push(output.value)
+            intermediate_data.put(output.key, values)
+        }
+        reply(Ok("Data added to shuffle"))
+    }
+    
+    on GetPartition(partition_id: Int) -> Array<ReduceInput<K2, V2>> {
+        let all_keys = intermediate_data.keys()
+        let partition_keys = []
+        
+        // Simple partitioning by key hash
+        for key in all_keys {
+            if hash_key(key) % partition_count == partition_id {
+                partition_keys.push(key)
+            }
+        }
+        
+        let partition_data = []
+        for key in partition_keys {
+            partition_data.push(ReduceInput<K2, V2> {
+                key: key,
+                values: intermediate_data.get(key)
+            })
+        }
+        
+        reply(partition_data)
+    }
+    
+    fun hash_key(key: K2) -> Int {
+        // Simplified hash function
+        return key.to_string().length() * 31
+    }
+}
+
+// JobTracker - coordinates the MapReduce job
+actor JobTracker<K, V, K2, V2, V3> {
+    state job_id: String
+    state mappers: Array<ActorRef>
+    state reducers: Array<ActorRef>
+    state shuffler: ActorRef
+    state mapper_count: Int
+    state reducer_count: Int
+    state input_splits: Array<Array<MapInput<K, V>>>
+    state final_results: Array<ReduceOutput<K2, V3>>
+    state start_time: Int
+    state state: String  // "idle", "mapping", "shuffling", "reducing", "complete"
+    
+    invariant mapper_count > 0 && reducer_count > 0
+    
+    new create(
+        id: String,
+        num_mappers: Int,
+        num_reducers: Int,
+        map_fn: fun(K, V) -> Array<MapOutput<K2, V2>>,
+        reduce_fn: fun(K2, Array<V2>) -> V3
+    ) {
+        job_id = id
+        mapper_count = num_mappers
+        reducer_count = num_reducers
+        mappers = []
+        reducers = []
+        shuffler = spawn Shuffler<K2, V2>(num_reducers)
+        input_splits = []
+        final_results = []
+        state = "idle"
+        
+        // Create mapper pool
+        for i in 0..num_mappers {
+            let mapper = spawn Mapper<K, V, K2, V2>("mapper_" + i.to_string(), map_fn)
+            mappers.push(mapper)
+        }
+        
+        // Create reducer pool
+        for i in 0..num_reducers {
+            let reducer = spawn Reducer<K2, V2, V3>("reducer_" + i.to_string(), reduce_fn)
+            reducers.push(reducer)
+        }
+        
+        println("JobTracker " + job_id + " initialized with " + 
+                num_mappers.to_string() + " mappers and " + 
+                num_reducers.to_string() + " reducers")
+    }
+    
+    on SubmitJob(input_data: Array<MapInput<K, V>>) {
+        start_time = time::now()
+        state = "mapping"
+        
+        // Split input data among mappers
+        let chunk_size = (input_data.length() + mapper_count - 1) / mapper_count
+        input_splits = []
+        
+        for i in 0..mapper_count {
+            let start_idx = i * chunk_size
+            let end_idx = min((i + 1) * chunk_size, input_data.length())
+            let chunk = input_data.slice(start_idx, end_idx)
+            input_splits.push(chunk)
+        }
+        
+        // Start map phase
+        run_map_phase()
+        
+        reply(Ok("Job " + job_id + " started"))
+    }
+    
+    fun run_map_phase() {
+        println("Starting map phase for job " + job_id)
+        
+        // Distribute work to mappers
+        let map_futures = []
+        for i in 0..mapper_count {
+            let mapper = mappers[i]
+            let chunk = input_splits[i]
+            let future = async {
+                ask(mapper, ProcessChunk(chunk)) timeout 30s
+            }
+            map_futures.push(future)
+        }
+        
+        // Collect map results
+        for future in map_futures {
+            let map_outputs = await future
+            send(shuffler, AddMapOutput(map_outputs))
+        }
+        
+        state = "shuffling"
+        run_shuffle_phase()
+    }
+    
+    fun run_shuffle_phase() {
+        println("Starting shuffle phase for job " + job_id)
+        
+        // Brief pause for shuffle to organize data
+        time::sleep(100ms)
+        
+        state = "reducing"
+        run_reduce_phase()
+    }
+    
+    fun run_reduce_phase() {
+        println("Starting reduce phase for job " + job_id)
+        
+        // Distribute partitions to reducers
+        let reduce_futures = []
+        for i in 0..reducer_count {
+            let reducer = reducers[i]
+            let partition = ask(shuffler, GetPartition(i)) timeout 5s
+            
+            for group in partition {
+                let future = async {
+                    ask(reducer, ProcessGroup(group)) timeout 10s
+                }
+                reduce_futures.push(future)
+            }
+        }
+        
+        // Collect reduce results
+        final_results = []
+        for future in reduce_futures {
+            let result = await future
+            final_results.push(result)
+        }
+        
+        state = "complete"
+        let elapsed = time::now() - start_time
+        println("Job " + job_id + " completed in " + elapsed.to_string() + "ms")
+    }
+    
+    on GetResults() {
+        if state == "complete" {
+            reply(Ok(final_results))
+        } else {
+            reply(Err("Job not complete. Current state: " + state))
+        }
+    }
+    
+    on GetJobStats() {
+        let mapper_stats = []
+        for mapper in mappers {
+            mapper_stats.push(ask(mapper, GetStats()) timeout 1s)
+        }
+        
+        let reducer_stats = []
+        for reducer in reducers {
+            reducer_stats.push(ask(reducer, GetStats()) timeout 1s)
+        }
+        
+        reply({
+            job_id: job_id,
+            state: state,
+            mapper_stats: mapper_stats,
+            reducer_stats: reducer_stats,
+            elapsed_time: time::now() - start_time
+        })
+    }
+}
+
+// Example: Word Count implementation
+actor WordCountExample {
+    new create() {
+        println("Running Word Count MapReduce Example")
+        
+        // Define map function for word count
+        let word_count_map = fun(line_num: Int, line: String) -> Array<MapOutput<String, Int>> {
+            let words = line.split(" ")
+            let outputs = []
+            
+            for word in words {
+                let clean_word = word.to_lowercase().trim()
+                if clean_word.length() > 0 {
+                    outputs.push(MapOutput<String, Int> {
+                        key: clean_word,
+                        value: 1
+                    })
+                }
+            }
+            
+            return outputs
+        }
+        
+        // Define reduce function for word count
+        let word_count_reduce = fun(word: String, counts: Array<Int>) -> Int {
+            let total = 0
+            for count in counts {
+                total = total + count
+            }
+            return total
+        }
+        
+        // Create job tracker
+        let job_tracker = spawn JobTracker<Int, String, String, Int, Int>(
+            "word_count_job",
+            4,  // 4 mappers
+            2,  // 2 reducers
+            word_count_map,
+            word_count_reduce
+        )
+        
+        // Prepare input data
+        let input_data = [
+            MapInput<Int, String> {key: 1, value: "the quick brown fox jumps over the lazy dog"},
+            MapInput<Int, String> {key: 2, value: "the dog was lazy but the fox was quick"},
+            MapInput<Int, String> {key: 3, value: "quick brown foxes are quick and brown"},
+            MapInput<Int, String> {key: 4, value: "lazy dogs sleep all day while quick foxes hunt"},
+            MapInput<Int, String> {key: 5, value: "the brown dog and the brown fox became friends"},
+            MapInput<Int, String> {key: 6, value: "foxes and dogs can be quick or lazy"}
+        ]
+        
+        // Submit job
+        let submission = ask(job_tracker, SubmitJob(input_data)) timeout 60s
+        println("Job submission: " + submission.to_string())
+        
+        // Wait for completion
+        time::sleep(2s)
+        
+        // Get results
+        let results = ask(job_tracker, GetResults()) timeout 5s
+        println("\nWord Count Results:")
+        if results.is_ok() {
+            for result in results.unwrap() {
+                println("  " + result.key + ": " + result.value.to_string())
+            }
+        }
+        
+        // Get job statistics
+        let stats = ask(job_tracker, GetJobStats()) timeout 2s
+        println("\nJob Statistics: " + stats.to_string())
+    }
+}
+
+// Example: Page Rank implementation
+actor PageRankExample {
+    type Page = {
+        url: String,
+        links: Array<String>,
+        rank: Float
+    }
+    
+    new create() {
+        println("Running PageRank MapReduce Example")
+        
+        // Define map function for PageRank
+        let pagerank_map = fun(url: String, page: Page) -> Array<MapOutput<String, Float>> {
+            let outputs = []
+            let num_links = page.links.length()
+            
+            if num_links > 0 {
+                let contribution = page.rank / num_links.to_float()
+                
+                for link in page.links {
+                    outputs.push(MapOutput<String, Float> {
+                        key: link,
+                        value: contribution
+                    })
+                }
+            }
+            
+            return outputs
+        }
+        
+        // Define reduce function for PageRank
+        let pagerank_reduce = fun(url: String, contributions: Array<Float>) -> Float {
+            let damping_factor = 0.85
+            let sum = 0.0
+            
+            for contribution in contributions {
+                sum = sum + contribution
+            }
+            
+            return (1.0 - damping_factor) + damping_factor * sum
+        }
+        
+        // Create sample web graph
+        let pages = [
+            Page {url: "A", links: ["B", "C"], rank: 1.0},
+            Page {url: "B", links: ["C"], rank: 1.0},
+            Page {url: "C", links: ["A"], rank: 1.0},
+            Page {url: "D", links: ["C"], rank: 1.0}
+        ]
+        
+        // Run multiple iterations
+        for iteration in 0..3 {
+            println("\nPageRank Iteration " + iteration.to_string())
+            
+            let job_tracker = spawn JobTracker<String, Page, String, Float, Float>(
+                "pagerank_iter_" + iteration.to_string(),
+                2,  // 2 mappers
+                2,  // 2 reducers
+                pagerank_map,
+                pagerank_reduce
+            )
+            
+            // Prepare input for this iteration
+            let input_data = []
+            for page in pages {
+                input_data.push(MapInput<String, Page> {
+                    key: page.url,
+                    value: page
+                })
+            }
+            
+            // Run MapReduce job
+            send(job_tracker, SubmitJob(input_data))
+            time::sleep(1s)
+            
+            // Update page ranks with results
+            let results = ask(job_tracker, GetResults()) timeout 5s
+            if results.is_ok() {
+                for result in results.unwrap() {
+                    // Update page rank in pages array
+                    for page in pages {
+                        if page.url == result.key {
+                            page.rank = result.value
+                        }
+                    }
+                }
+            }
+            
+            // Print current rankings
+            println("Current PageRanks:")
+            for page in pages {
+                println("  " + page.url + ": " + page.rank.to_string())
+            }
+        }
+    }
+}
+
+// Main entry point
+actor Main {
+    new create() {
+        println("=== GAL MapReduce Framework ===\n")
+        
+        // Run word count example
+        let word_count = spawn WordCountExample()
+        time::sleep(3s)
+        
+        println("\n" + "=".repeat(50) + "\n")
+        
+        // Run PageRank example
+        let pagerank = spawn PageRankExample()
+        time::sleep(5s)
+        
+        println("\n=== MapReduce Examples Complete ===")
+    }
+}
+
+// Helper functions
+fun min(a: Int, b: Int) -> Int {
+    if a < b { return a } else { return b }
+}

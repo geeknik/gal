@@ -1,0 +1,391 @@
+//! Comprehensive const generics demonstration for GAL
+//! This example showcases compile-time guarantees and zero-cost abstractions
+
+// Const functions for compile-time evaluation
+const fn factorial(n: Int) -> Int {
+    if n <= 1 { 1 } else { n * factorial(n - 1) }
+}
+
+const fn max(a: Int, b: Int) -> Int {
+    if a > b { a } else { b }
+}
+
+const fn min(a: Int, b: Int) -> Int {
+    if a < b { a } else { b }
+}
+
+// Const declarations
+const MAX_POOL_SIZE: Int = 100;
+const MIN_POOL_SIZE: Int = 1;
+const DEFAULT_CAPACITY: Int = 10;
+
+// Rate limiter with compile-time capacity guarantees
+actor RateLimiter<const MAX_RATE: Int> 
+where MAX_RATE > 0, MAX_RATE <= 1000
+{
+    state requests: RingBuffer<MAX_RATE>
+    state current_count: Int = 0
+    
+    invariant current_count >= 0
+    invariant current_count <= MAX_RATE
+    
+    on Request(r) => {
+        if current_count < MAX_RATE {
+            current_count = current_count + 1;
+            requests.push(r);
+            forward(r)
+        } else {
+            reply(ErrorResponse(429, "Rate limit exceeded"))
+        }
+    }
+    
+    on Reset => {
+        current_count = 0;
+        requests.clear()
+    }
+}
+
+// Fixed-size matrix with compile-time dimensions
+type Matrix<const ROWS: Int, const COLS: Int> = [[Float; COLS]; ROWS]
+where ROWS > 0, COLS > 0;
+
+// Compile-time validated batch processor
+fn process_batch<const N: Int>(items: [Item; N]) -> Result<[ProcessedItem; N], ProcessingError>
+where N > 0, N <= 1000
+{
+    let mut results: [ProcessedItem; N] = unsafe { uninitialized() };
+    
+    for i in 0..N {
+        results[i] = process_item(items[i])?;
+    }
+    
+    Ok(results)
+}
+
+// Actor pool with compile-time size validation
+actor FixedPool<T, const SIZE: Int = DEFAULT_CAPACITY> 
+where SIZE > 0, SIZE <= MAX_POOL_SIZE
+{
+    state pool: [Option<T>; SIZE]
+    state available: Int = SIZE
+    
+    invariant available >= 0
+    invariant available <= SIZE
+    
+    on Acquire => {
+        if available > 0 {
+            // Find first available slot
+            for i in 0..SIZE {
+                if pool[i].is_none() {
+                    let resource = create_resource();
+                    pool[i] = Some(resource);
+                    available = available - 1;
+                    reply(Ok(resource))
+                    return;
+                }
+            }
+        }
+        reply(Err(PoolExhausted))
+    }
+    
+    on Release(resource: T) => {
+        // Find and release the resource
+        for i in 0..SIZE {
+            if pool[i] == Some(resource) {
+                pool[i] = None;
+                available = available + 1;
+                reply(Ok(()))
+                return;
+            }
+        }
+        reply(Err(ResourceNotFound))
+    }
+    
+    on PoolStatus => {
+        reply(PoolInfo {
+            total_size: SIZE,
+            available: available,
+            used: SIZE - available
+        })
+    }
+}
+
+// Zero-cost circular buffer with compile-time capacity
+actor CircularBuffer<T, const CAPACITY: Int>
+where CAPACITY > 0, CAPACITY & (CAPACITY - 1) == 0  // Must be power of 2
+{
+    state buffer: [Option<T>; CAPACITY]
+    state head: Int = 0
+    state tail: Int = 0
+    state count: Int = 0
+    
+    invariant count >= 0
+    invariant count <= CAPACITY
+    invariant head >= 0 && head < CAPACITY
+    invariant tail >= 0 && tail < CAPACITY
+    
+    on Push(item: T) => {
+        if count < CAPACITY {
+            buffer[tail] = Some(item);
+            tail = (tail + 1) & (CAPACITY - 1);  // Fast modulo for power of 2
+            count = count + 1;
+            reply(Ok(()))
+        } else {
+            reply(Err(BufferFull))
+        }
+    }
+    
+    on Pop => {
+        if count > 0 {
+            let item = buffer[head].take();
+            head = (head + 1) & (CAPACITY - 1);
+            count = count - 1;
+            reply(Ok(item))
+        } else {
+            reply(Err(BufferEmpty))
+        }
+    }
+    
+    // Compile-time optimized batch operations
+    on BatchPush(items: [T; BATCH_SIZE]) 
+    where const BATCH_SIZE: Int, BATCH_SIZE <= CAPACITY
+    => {
+        if count + BATCH_SIZE <= CAPACITY {
+            for i in 0..BATCH_SIZE {
+                buffer[tail] = Some(items[i]);
+                tail = (tail + 1) & (CAPACITY - 1);
+            }
+            count = count + BATCH_SIZE;
+            reply(Ok(()))
+        } else {
+            reply(Err(InsufficientSpace(CAPACITY - count)))
+        }
+    }
+}
+
+// Memory pool with compile-time block size and count
+actor MemoryPool<const BLOCK_SIZE: Int, const BLOCK_COUNT: Int>
+where BLOCK_SIZE >= 8,     // Minimum alignment
+      BLOCK_SIZE % 8 == 0, // Must be aligned
+      BLOCK_COUNT > 0,
+      BLOCK_COUNT <= 10000
+{
+    state memory: [u8; BLOCK_SIZE * BLOCK_COUNT]
+    state free_blocks: [Bool; BLOCK_COUNT]
+    state free_count: Int = BLOCK_COUNT
+    
+    invariant free_count >= 0
+    invariant free_count <= BLOCK_COUNT
+    
+    on Allocate => {
+        if free_count > 0 {
+            for i in 0..BLOCK_COUNT {
+                if free_blocks[i] {
+                    free_blocks[i] = false;
+                    free_count = free_count - 1;
+                    let ptr = memory.as_ptr() + (i * BLOCK_SIZE);
+                    reply(Ok(MemoryBlock { ptr, size: BLOCK_SIZE }))
+                    return;
+                }
+            }
+        }
+        reply(Err(OutOfMemory))
+    }
+    
+    on Deallocate(block: MemoryBlock) => {
+        let offset = block.ptr - memory.as_ptr();
+        if offset >= 0 && offset < (BLOCK_SIZE * BLOCK_COUNT) && offset % BLOCK_SIZE == 0 {
+            let index = offset / BLOCK_SIZE;
+            if !free_blocks[index] {
+                free_blocks[index] = true;
+                free_count = free_count + 1;
+                reply(Ok(()))
+            } else {
+                reply(Err(DoubleFree))
+            }
+        } else {
+            reply(Err(InvalidBlock))
+        }
+    }
+}
+
+// Network packet processor with compile-time packet size validation
+actor PacketProcessor<const MAX_PACKET_SIZE: Int, const BUFFER_COUNT: Int = 64>
+where MAX_PACKET_SIZE >= 64,     // Minimum Ethernet frame
+      MAX_PACKET_SIZE <= 9000,   // Maximum jumbo frame
+      BUFFER_COUNT > 0,
+      BUFFER_COUNT <= 1024
+{
+    state packet_buffers: [PacketBuffer<MAX_PACKET_SIZE>; BUFFER_COUNT]
+    state active_buffers: Int = 0
+    
+    invariant active_buffers >= 0
+    invariant active_buffers <= BUFFER_COUNT
+    
+    on ProcessPacket(data: [u8; PACKET_SIZE]) 
+    where const PACKET_SIZE: Int, PACKET_SIZE <= MAX_PACKET_SIZE
+    => {
+        if active_buffers < BUFFER_COUNT {
+            let buffer_index = find_free_buffer();
+            packet_buffers[buffer_index].load(data);
+            active_buffers = active_buffers + 1;
+            
+            // Process packet based on its size
+            match PACKET_SIZE {
+                64 => process_minimal_packet(packet_buffers[buffer_index]),
+                1500 => process_standard_packet(packet_buffers[buffer_index]),
+                9000 => process_jumbo_packet(packet_buffers[buffer_index]),
+                _ => process_custom_packet(packet_buffers[buffer_index])
+            }
+            
+            active_buffers = active_buffers - 1;
+            reply(Ok(()))
+        } else {
+            reply(Err(NoBuffersAvailable))
+        }
+    }
+}
+
+// Compile-time matrix multiplication with size validation
+fn matrix_multiply<const M: Int, const N: Int, const P: Int>(
+    a: Matrix<M, N>, 
+    b: Matrix<N, P>
+) -> Matrix<M, P>
+where M > 0, N > 0, P > 0,
+      M <= 1000, N <= 1000, P <= 1000  // Prevent excessive compilation times
+{
+    let mut result: Matrix<M, P> = [[0.0; P]; M];
+    
+    for i in 0..M {
+        for j in 0..P {
+            for k in 0..N {
+                result[i][j] = result[i][j] + a[i][k] * b[k][j];
+            }
+        }
+    }
+    
+    result
+}
+
+// Template specialization for common matrix sizes
+const fn is_power_of_2(n: Int) -> Bool {
+    n > 0 && (n & (n - 1)) == 0
+}
+
+// Optimized implementation for power-of-2 sized matrices
+fn matrix_multiply_optimized<const N: Int>(
+    a: Matrix<N, N>, 
+    b: Matrix<N, N>
+) -> Matrix<N, N>
+where N > 0, is_power_of_2(N), N <= 512
+{
+    // Use cache-friendly blocked multiplication for power-of-2 sizes
+    matrix_multiply_blocked(a, b)
+}
+
+// Error types with const generic context
+enum PoolError<const SIZE: Int> {
+    PoolExhausted { capacity: Int = SIZE },
+    ResourceNotFound,
+    InvalidResource
+}
+
+enum BufferError<const CAPACITY: Int> {
+    BufferFull { capacity: Int = CAPACITY },
+    BufferEmpty,
+    InsufficientSpace(Int)
+}
+
+// Trait for compile-time sized collections
+trait FixedSizeCollection<T, const SIZE: Int> {
+    fn capacity() -> Int { SIZE }
+    fn is_full(&self) -> Bool;
+    fn is_empty(&self) -> Bool;
+    fn len(&self) -> Int;
+    
+    // Default implementation using const SIZE
+    fn remaining_capacity(&self) -> Int {
+        SIZE - self.len()
+    }
+}
+
+// Implementation for arrays
+impl<T, const SIZE: Int> FixedSizeCollection<T, SIZE> for [T; SIZE] {
+    fn is_full(&self) -> Bool { self.len() == SIZE }
+    fn is_empty(&self) -> Bool { self.len() == 0 }
+    fn len(&self) -> Int { SIZE }  // Arrays are always full
+}
+
+// Const-generic actor system with compile-time topology validation
+actor SystemTopology<const NODE_COUNT: Int, const MAX_CONNECTIONS: Int>
+where NODE_COUNT > 0,
+      NODE_COUNT <= 1000,
+      MAX_CONNECTIONS > 0,
+      MAX_CONNECTIONS <= NODE_COUNT * (NODE_COUNT - 1) / 2  // Max edges in complete graph
+{
+    state nodes: [NodeId; NODE_COUNT]
+    state connections: [Connection; MAX_CONNECTIONS]
+    state connection_count: Int = 0
+    
+    invariant connection_count >= 0
+    invariant connection_count <= MAX_CONNECTIONS
+    
+    on CreateConnection(from: NodeId, to: NodeId) => {
+        if connection_count < MAX_CONNECTIONS {
+            connections[connection_count] = Connection { from, to };
+            connection_count = connection_count + 1;
+            reply(Ok(()))
+        } else {
+            reply(Err(TooManyConnections(MAX_CONNECTIONS)))
+        }
+    }
+    
+    // Compile-time validation of network diameter
+    on ValidateTopology => 
+    where const MAX_DIAMETER: Int = NODE_COUNT - 1
+    {
+        let diameter = calculate_diameter();
+        if diameter <= MAX_DIAMETER {
+            reply(Ok(TopologyValid))
+        } else {
+            reply(Err(TopologyInvalid { 
+                actual_diameter: diameter, 
+                max_allowed: MAX_DIAMETER 
+            }))
+        }
+    }
+}
+
+// Main function demonstrating usage
+fn main() {
+    // Create rate limiter with compile-time rate limit
+    let rate_limiter = spawn RateLimiter<100>;
+    
+    // Create fixed pool with compile-time size
+    let resource_pool = spawn FixedPool<DatabaseConnection, 20>;
+    
+    // Create circular buffer with power-of-2 capacity for optimal performance
+    let packet_buffer = spawn CircularBuffer<NetworkPacket, 256>;
+    
+    // Create memory pool with specific block characteristics
+    let memory_pool = spawn MemoryPool<1024, 100>;  // 1KB blocks, 100 blocks
+    
+    // Create system topology with known constraints
+    let network = spawn SystemTopology<50, 200>;    // 50 nodes, max 200 connections
+    
+    // Compile-time matrix operations
+    let a: Matrix<3, 4> = create_matrix();
+    let b: Matrix<4, 5> = create_matrix();
+    let c = matrix_multiply(a, b);  // Results in Matrix<3, 5>
+    
+    // Const expressions are evaluated at compile time
+    const POOL_CAPACITY: Int = factorial(5) + 10;   // 130
+    const BUFFER_SIZE: Int = max(1024, min(2048, factorial(4))); // 1024
+    
+    println("System initialized with compile-time guarantees");
+    println("Rate limiter capacity: {}", 100);
+    println("Pool capacity: {}", 20);
+    println("Buffer capacity: {}", 256);
+    println("Computed pool capacity: {}", POOL_CAPACITY);
+    println("Computed buffer size: {}", BUFFER_SIZE);
+}

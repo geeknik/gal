@@ -1,0 +1,118 @@
+// chaos_demo.gal - Demonstrating chaos engineering features
+
+// A resilient counter with chaos injection
+@chaos_test(faults: [MessageDrop(0.1), MessageDelay(50ms..200ms)])
+actor ResilientCounter {
+    state value: Int
+    state name: String
+    
+    // Invariant that must always hold
+    invariant value >= 0
+    
+    new create(counter_name: String) {
+        name = counter_name
+        value = 0
+        println("Created resilient counter: " + name)
+    }
+    
+    on Increment 
+        ensures self.value > old(self.value)
+    {
+        value = value + 1
+        reply(value)
+    }
+    
+    on Decrement
+        requires self.value > 0
+        ensures self.value < old(self.value)
+    {
+        if value > 0 {
+            value = value - 1
+            reply(Ok(value))
+        } else {
+            reply(Err("Cannot decrement below zero"))
+        }
+    }
+    
+    on GetValue {
+        reply(value)
+    }
+    
+    // Handle errors gracefully
+    on Error(msg: String) {
+        println(name + " received error: " + msg)
+        reply(Ok("Error handled"))
+    }
+}
+
+// Supervisor for fault tolerance
+actor CounterSupervisor {
+    state counters: Array<ActorRef>
+    
+    new create() {
+        counters = []
+        println("Supervisor initialized")
+    }
+    
+    on CreateCounter(name: String) {
+        let counter = spawn_supervised ResilientCounter(name) 
+            with RestartStrategy::OneForOne
+        counters.push(counter)
+        reply(counter)
+    }
+    
+    on ActorFailed(actor: ActorRef, reason: String) {
+        println("Actor failed: " + reason)
+        println("Restarting actor...")
+        // Supervisor automatically restarts the failed actor
+    }
+}
+
+// Test the chaos features
+actor Main {
+    new create() {
+        // Create supervisor
+        let supervisor = spawn CounterSupervisor()
+        
+        // Create counters under supervision
+        let counter1 = ask(supervisor, CreateCounter("Counter-1")) timeout 1s
+        let counter2 = ask(supervisor, CreateCounter("Counter-2")) timeout 1s
+        
+        // Enable chaos globally
+        chaos.enable([
+            MessageDrop(0.15),
+            MessageDelay(100ms..500ms),
+            ActorCrash(0.05)
+        ])
+        
+        // Perform operations under chaos
+        println("Starting chaos test...")
+        
+        for i in 0..20 {
+            try {
+                let result = ask(counter1, Increment) timeout 2s
+                println("Counter1 value: " + result)
+            } catch TimeoutError {
+                println("Operation timed out due to chaos")
+            }
+            
+            try {
+                let result = ask(counter2, Increment) timeout 2s
+                println("Counter2 value: " + result)
+            } catch TimeoutError {
+                println("Operation timed out due to chaos")
+            }
+        }
+        
+        // Disable chaos
+        chaos.disable()
+        
+        // Verify final state
+        let final1 = ask(counter1, GetValue) timeout 1s
+        let final2 = ask(counter2, GetValue) timeout 1s
+        
+        println("Final counter1: " + final1)
+        println("Final counter2: " + final2)
+        println("Chaos test completed successfully!")
+    }
+}

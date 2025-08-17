@@ -1,0 +1,393 @@
+// Example demonstrating GAL's deterministic replay system with time-travel debugging
+// This shows how to record execution, replay with exact timing, and debug with breakpoints
+
+import std.actors.*
+import std.chaos.*
+import std.replay.*
+
+// Example actor that processes payments with chaos scenarios
+@record_execution
+actor PaymentProcessor {
+    state {
+        processed_payments: Vec<Payment>
+        error_count: u64
+        total_amount: Currency
+    }
+
+    on ProcessPayment(payment: Payment) => {
+        // Begin trace for causal tracking
+        let trace_id = replay.begin_trace()
+        
+        // Chaos might inject various faults here
+        chaos.maybe_inject(NetworkDelay(100ms..500ms))
+        chaos.maybe_inject(ServiceUnavailable(probability: 0.05))
+        
+        // Process the payment with potential failures
+        let result = match self.validate_payment(payment) {
+            Ok(valid_payment) => {
+                self.processed_payments.push(valid_payment)
+                self.total_amount += valid_payment.amount
+                PaymentResult.Success(valid_payment.id)
+            }
+            Err(error) => {
+                self.error_count += 1
+                chaos.maybe_inject(DatabaseTimeout(duration: 2s))
+                PaymentResult.Failed(error)
+            }
+        }
+        
+        // End trace
+        replay.end_trace(trace_id)
+        
+        // Send result to requester
+        send(payment.sender, result)
+    }
+    
+    on GetStats() => {
+        send(sender, PaymentStats {
+            processed_count: self.processed_payments.len(),
+            error_count: self.error_count,
+            total_amount: self.total_amount
+        })
+    }
+    
+    fn validate_payment(payment: Payment) -> Result<Payment, PaymentError> {
+        // Simulate validation with possible chaos injection
+        chaos.injection_point("payment_validation")
+        
+        if payment.amount <= 0 {
+            return Err(PaymentError.InvalidAmount)
+        }
+        
+        if payment.account.is_empty() {
+            return Err(PaymentError.InvalidAccount)
+        }
+        
+        // Simulate network call to payment gateway
+        chaos.maybe_inject(NetworkPartition(duration: 5s))
+        let gateway_result = payment_gateway.validate(payment)
+        
+        match gateway_result {
+            Ok(_) => Ok(payment),
+            Err(e) => Err(PaymentError.GatewayError(e))
+        }
+    }
+}
+
+// Test scenario with deterministic replay
+#[test]
+fn test_payment_idempotency_with_replay() {
+    // Configure recording with comprehensive event capture
+    let recording_config = RecordingConfig {
+        record_messages: true,
+        record_state_changes: true,
+        record_chaos_events: true,
+        record_timing: true,
+        snapshot_interval: 1s,
+        privacy_mode: PrivacyMode.RedactSensitive
+    }
+    
+    // Start recording session
+    let session = replay.start_recording("payment_failure_scenario.chaos", recording_config)
+    
+    // Create payment processor
+    let processor = spawn PaymentProcessor {
+        processed_payments: Vec.new(),
+        error_count: 0,
+        total_amount: 0
+    }
+    
+    // Create test payments
+    let payments = [
+        Payment { id: 1, amount: 100, account: "acc1", sender: self },
+        Payment { id: 2, amount: 200, account: "acc2", sender: self },
+        Payment { id: 3, amount: -50, account: "acc3", sender: self }, // Invalid amount
+        Payment { id: 4, amount: 150, account: "", sender: self }      // Invalid account
+    ]
+    
+    // Configure chaos for this test scenario
+    chaos.configure {
+        seed: 42, // Deterministic seed for reproducible chaos
+        faults: [
+            NetworkDelay(probability: 0.3, duration: 100ms..500ms),
+            ServiceUnavailable(probability: 0.1),
+            DatabaseTimeout(probability: 0.05, duration: 2s)
+        ]
+    }
+    
+    // Process all payments
+    for payment in payments {
+        send(processor, ProcessPayment(payment))
+    }
+    
+    // Wait for processing and get final stats
+    send(processor, GetStats())
+    let final_stats = await_response(5s)
+    
+    // Stop recording
+    let recording_stats = session.stop()
+    
+    assert(recording_stats.events_recorded > 0)
+    assert(recording_stats.snapshots_taken > 0)
+    
+    // Now replay the exact same scenario
+    replay_and_verify("payment_failure_scenario.chaos")
+}
+
+fn replay_and_verify(recording_path: str) {
+    // Load the recording
+    let recording = replay.load_recording(recording_path)
+    
+    // Configure replay with debugging features
+    let replay_config = ReplayConfig {
+        deterministic_mode: true,
+        speed_multiplier: 1.0, // Real-time replay
+        enable_breakpoints: true,
+        stop_on_divergence: true
+    }
+    
+    // Create replay runtime
+    let replay_runtime = ReplayRuntime.new(recording, replay_config)
+    
+    // Set breakpoints for debugging
+    replay_runtime.set_event_breakpoint(
+        event_type: "ChaosInjection", 
+        condition: "fault_type == 'NetworkDelay'"
+    )
+    
+    replay_runtime.set_actor_breakpoint(
+        actor_type: "PaymentProcessor",
+        trigger: ActorTrigger.StateChanged(field: "error_count"),
+        condition: "new_value > old_value"
+    )
+    
+    // Add watch expressions for monitoring
+    replay_runtime.add_watch_expression(
+        expression: "processor.total_amount",
+        frequency: EvaluationFrequency.EveryEvent
+    )
+    
+    replay_runtime.add_watch_expression(
+        expression: "chaos.active_faults.len()",
+        frequency: EvaluationFrequency.OnStateChange
+    )
+    
+    // Start replay
+    replay_runtime.start()
+    
+    // Replay will automatically pause at breakpoints
+    // We can inspect state at any point
+    while !replay_runtime.is_completed() {
+        match replay_runtime.get_execution_state() {
+            ExecutionState.Paused(reason) => {
+                println("Paused: {}", reason)
+                
+                // Inspect current state
+                let processor_state = replay_runtime.inspect_actor_state("PaymentProcessor")
+                println("Processor state: {}", processor_state.formatted_state)
+                
+                // Check watch expressions
+                let watch_values = replay_runtime.get_watch_expression_values()
+                for (expr, value) in watch_values {
+                    println("Watch: {} = {}", expr, value)
+                }
+                
+                // Continue or step
+                if reason == PauseReason.Breakpoint {
+                    replay_runtime.step_forward() // Step through breakpoint
+                } else {
+                    replay_runtime.resume() // Continue execution
+                }
+            }
+            
+            ExecutionState.Diverged(divergence) => {
+                println("Divergence detected: {}", divergence.description)
+                
+                // Analyze the divergence
+                let causal_graph = replay_runtime.generate_causal_graph(
+                    CausalRenderingOptions {
+                        highlight_critical_path: true,
+                        show_timing: true,
+                        filter_event_types: ["ChaosInjection", "MessageSent"]
+                    }
+                )
+                
+                // Save divergence analysis
+                write_file("divergence_analysis.dot", causal_graph)
+                
+                break
+            }
+            
+            ExecutionState.Failed(error) => {
+                println("Replay failed: {}", error)
+                break
+            }
+            
+            _ => {
+                // Continue running
+                sleep(10ms)
+            }
+        }
+    }
+    
+    // Get final replay metrics
+    let metrics = replay_runtime.get_metrics()
+    println("Replay completed:")
+    println("  Events replayed: {}", metrics.total_events_processed)
+    println("  Divergences: {}", metrics.divergences_detected)
+    println("  Breakpoints hit: {}", metrics.breakpoints_hit)
+    println("  Time travel operations: {}", metrics.time_travel_operations)
+}
+
+// Time-travel debugging example
+#[test]
+fn test_time_travel_debugging() {
+    let recording = replay.load_recording("payment_failure_scenario.chaos")
+    let replay_runtime = ReplayRuntime.new(recording, ReplayConfig.default())
+    
+    replay_runtime.start()
+    
+    // Let it run to completion first
+    replay_runtime.fast_forward_to_end()
+    
+    // Now travel back in time to investigate an issue
+    let error_event_time = replay_runtime.find_events_matching("error_count > 0")[0].timestamp
+    
+    // Jump back to just before the error occurred
+    replay_runtime.rewind(error_event_time - 1s)
+    
+    // Set up detailed monitoring
+    replay_runtime.set_actor_breakpoint(
+        actor_type: "PaymentProcessor",
+        trigger: ActorTrigger.MessageReceived,
+        condition: "message.type == 'ProcessPayment'"
+    )
+    
+    // Step through the problematic execution slowly
+    while replay_runtime.current_time() < error_event_time + 5s {
+        replay_runtime.step_forward()
+        
+        // Examine state at each step
+        let state = replay_runtime.inspect_actor_state("PaymentProcessor")
+        let changes = replay_runtime.get_state_changes_since_last_step()
+        
+        for change in changes {
+            println("State change: {} = {} -> {}", 
+                   change.field_path, change.old_value, change.new_value)
+        }
+        
+        // Check for chaos injection
+        let chaos_events = replay_runtime.get_chaos_events_at_current_time()
+        for event in chaos_events {
+            println("Chaos injected: {} with parameters: {:?}", 
+                   event.fault_type, event.parameters)
+        }
+    }
+    
+    // Generate comprehensive analysis
+    let message_flow = replay_runtime.generate_flow_diagram(
+        FlowRenderingOptions {
+            show_latencies: true,
+            show_errors: true,
+            time_window: Some((error_event_time - 2s, error_event_time + 2s))
+        }
+    )
+    
+    write_file("message_flow_analysis.svg", message_flow)
+}
+
+// Production continuous recording example
+fn setup_production_recording() {
+    // Configure for production with privacy and performance considerations
+    let config = RecordingConfig {
+        max_events: Some(10_000_000), // 10M events max
+        event_buffer_size: 100_000,   // Large buffer for performance
+        enable_compression: true,      // Compress for storage efficiency
+        record_io: false,             // Don't record I/O in production
+        record_chaos: true,           // Always record chaos events
+        snapshot_interval: 30s,       // Snapshots every 30 seconds
+        
+        // Privacy settings for production
+        actor_filter: Some(["PaymentProcessor", "OrderProcessor"]), // Only record critical actors
+        redaction_rules: [
+            RedactionRule {
+                pattern: r"account_number:\s*\d+",
+                replacement: "account_number: [REDACTED]",
+                applies_to: [EventType.MessageSent, EventType.StateChange]
+            },
+            RedactionRule {
+                pattern: r"credit_card:\s*\d{4}-\d{4}-\d{4}-\d{4}",
+                replacement: "credit_card: [REDACTED]",
+                applies_to: [EventType.MessageSent]
+            }
+        ]
+    }
+    
+    // Start continuous recording with ring buffer
+    let session = replay.start_continuous_recording("/var/log/gal/recordings", config)
+    
+    // The ring buffer will automatically manage storage and keep recent events
+    // Recordings can be saved when issues are detected
+    
+    session
+}
+
+// Main example showing full workflow
+fn main() {
+    println("GAL Deterministic Replay System Demo")
+    
+    // 1. Set up production recording
+    let recording_session = setup_production_recording()
+    
+    // 2. Run normal operations (this would be your actual application)
+    // simulate_production_workload()
+    
+    // 3. When an issue is detected, save the recording
+    if detect_issue() {
+        let saved_recording = recording_session.save_current_window("issue_#{}", issue_id)
+        println("Saved recording for issue analysis: {}", saved_recording.path)
+        
+        // 4. Analyze the issue with replay
+        analyze_issue_with_replay(saved_recording.path)
+    }
+    
+    println("Demo completed - check output files for analysis results")
+}
+
+fn detect_issue() -> bool {
+    // Simplified issue detection
+    true
+}
+
+fn analyze_issue_with_replay(recording_path: str) {
+    println("Analyzing issue using recording: {}", recording_path)
+    
+    let recording = replay.load_recording(recording_path)
+    let replay_runtime = ReplayRuntime.new(recording, ReplayConfig {
+        deterministic_mode: true,
+        speed_multiplier: 10.0, // Fast replay for analysis
+        enable_breakpoints: true
+    })
+    
+    // Find error events
+    let error_events = replay_runtime.find_events_matching("error_count > 0")
+    
+    for error_event in error_events {
+        println("Found error at time {}: {}", error_event.timestamp, error_event.description)
+        
+        // Jump to just before the error
+        replay_runtime.jump_to_time(error_event.timestamp - 5s)
+        
+        // Analyze the causal chain leading to the error
+        let causal_deps = replay_runtime.get_causal_dependencies(error_event.id)
+        println("Causal dependencies: {:?}", causal_deps)
+        
+        // Generate timeline view
+        let timeline = replay_runtime.generate_timeline_view(
+            error_event.timestamp - 30s,
+            error_event.timestamp + 10s
+        )
+        
+        write_file("error_timeline_{}.html", timeline)
+    }
+}

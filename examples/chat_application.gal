@@ -1,0 +1,663 @@
+// Real-time Chat Application with Multiple Rooms
+// Demonstrates: actor-based messaging, state management, real-time communication
+
+use stdlib::*
+
+// Message types for the chat system
+type ChatMessage = {
+    id: String,
+    sender: String,
+    room: String,
+    content: String,
+    timestamp: Int,
+    message_type: String  // "text", "image", "file", "system"
+}
+
+type UserProfile = {
+    username: String,
+    display_name: String,
+    avatar_url: String,
+    status: String,  // "online", "away", "offline"
+    joined_at: Int,
+    last_seen: Int
+}
+
+// Individual chat room actor
+@chaos_test(faults: [MessageDelay(50ms..200ms)])
+actor ChatRoom {
+    state room_id: String
+    state room_name: String
+    state members: HashMap<String, ActorRef>
+    state message_history: Array<ChatMessage>
+    state max_history: Int
+    state is_private: Bool
+    state admin_users: Array<String>
+    state banned_users: Array<String>
+    
+    invariant message_history.length() <= max_history
+    invariant members.size() <= 1000  // Max 1000 users per room
+    
+    new create(id: String, name: String, is_private_room: Bool) {
+        room_id = id
+        room_name = name
+        members = HashMap::new()
+        message_history = []
+        max_history = 1000
+        is_private = is_private_room
+        admin_users = []
+        banned_users = []
+        
+        println("Chat room created: " + room_name + " (" + room_id + ")")
+    }
+    
+    // User joins the room
+    on JoinRoom(user_id: String, user_ref: ActorRef, profile: UserProfile)
+        requires !banned_users.contains(user_id)
+        ensures members.contains(user_id)
+    {
+        if banned_users.contains(user_id) {
+            reply(Err("User is banned from this room"))
+            return
+        }
+        
+        if is_private && !is_authorized(user_id) {
+            reply(Err("This is a private room"))
+            return
+        }
+        
+        members.put(user_id, user_ref)
+        
+        // Notify all members
+        let system_msg = ChatMessage {
+            id: generate_message_id(),
+            sender: "system",
+            room: room_id,
+            content: profile.display_name + " joined the room",
+            timestamp: time::now(),
+            message_type: "system"
+        }
+        
+        broadcast_message(system_msg)
+        add_to_history(system_msg)
+        
+        // Send recent history to new member
+        let recent = get_recent_messages(50)
+        send(user_ref, ReceiveHistory(recent))
+        
+        reply(Ok("Joined room: " + room_name))
+    }
+    
+    // User leaves the room
+    on LeaveRoom(user_id: String, profile: UserProfile)
+        ensures !members.contains(user_id)
+    {
+        if members.contains(user_id) {
+            members.remove(user_id)
+            
+            let system_msg = ChatMessage {
+                id: generate_message_id(),
+                sender: "system",
+                room: room_id,
+                content: profile.display_name + " left the room",
+                timestamp: time::now(),
+                message_type: "system"
+            }
+            
+            broadcast_message(system_msg)
+            add_to_history(system_msg)
+            
+            reply(Ok("Left room: " + room_name))
+        } else {
+            reply(Err("User not in room"))
+        }
+    }
+    
+    // Send message to the room
+    on SendMessage(user_id: String, content: String, msg_type: String)
+        requires members.contains(user_id)
+        requires content.length() > 0 && content.length() <= 5000
+    {
+        if !members.contains(user_id) {
+            reply(Err("User not in room"))
+            return
+        }
+        
+        if is_message_spam(user_id, content) {
+            reply(Err("Message rejected: spam detected"))
+            return
+        }
+        
+        let message = ChatMessage {
+            id: generate_message_id(),
+            sender: user_id,
+            room: room_id,
+            content: filter_content(content),
+            timestamp: time::now(),
+            message_type: msg_type
+        }
+        
+        broadcast_message(message)
+        add_to_history(message)
+        
+        reply(Ok(message.id))
+    }
+    
+    // Edit a message
+    on EditMessage(user_id: String, message_id: String, new_content: String)
+        requires members.contains(user_id)
+    {
+        let message = find_message(message_id)
+        
+        if message == null {
+            reply(Err("Message not found"))
+            return
+        }
+        
+        if message.sender != user_id && !admin_users.contains(user_id) {
+            reply(Err("Cannot edit others' messages"))
+            return
+        }
+        
+        // Update message
+        message.content = filter_content(new_content)
+        
+        // Notify all members of edit
+        broadcast_edit(message_id, new_content)
+        
+        reply(Ok("Message edited"))
+    }
+    
+    // Delete a message
+    on DeleteMessage(user_id: String, message_id: String)
+        requires members.contains(user_id)
+    {
+        let message = find_message(message_id)
+        
+        if message == null {
+            reply(Err("Message not found"))
+            return
+        }
+        
+        if message.sender != user_id && !admin_users.contains(user_id) {
+            reply(Err("Cannot delete others' messages"))
+            return
+        }
+        
+        // Remove from history
+        message_history = message_history.filter(|m| m.id != message_id)
+        
+        // Notify all members of deletion
+        broadcast_deletion(message_id)
+        
+        reply(Ok("Message deleted"))
+    }
+    
+    // Get room members
+    on GetMembers() {
+        let member_list = members.keys()
+        reply(member_list)
+    }
+    
+    // Get message history
+    on GetHistory(count: Int) {
+        let messages = get_recent_messages(min(count, 100))
+        reply(messages)
+    }
+    
+    // Admin operations
+    on PromoteAdmin(admin_id: String, target_user: String)
+        requires admin_users.contains(admin_id)
+    {
+        if !admin_users.contains(target_user) {
+            admin_users.push(target_user)
+            reply(Ok("User promoted to admin"))
+        } else {
+            reply(Err("User is already admin"))
+        }
+    }
+    
+    on BanUser(admin_id: String, target_user: String)
+        requires admin_users.contains(admin_id)
+        ensures banned_users.contains(target_user)
+    {
+        if members.contains(target_user) {
+            let user_ref = members.get(target_user)
+            members.remove(target_user)
+            banned_users.push(target_user)
+            
+            send(user_ref, Kicked(room_id, "You have been banned"))
+            
+            reply(Ok("User banned"))
+        } else {
+            reply(Err("User not in room"))
+        }
+    }
+    
+    // Helper functions
+    fun broadcast_message(message: ChatMessage) {
+        for (user_id, user_ref) in members {
+            send(user_ref, ReceiveMessage(message))
+        }
+    }
+    
+    fun broadcast_edit(message_id: String, new_content: String) {
+        for (user_id, user_ref) in members {
+            send(user_ref, MessageEdited(message_id, new_content))
+        }
+    }
+    
+    fun broadcast_deletion(message_id: String) {
+        for (user_id, user_ref) in members {
+            send(user_ref, MessageDeleted(message_id))
+        }
+    }
+    
+    fun add_to_history(message: ChatMessage) {
+        message_history.push(message)
+        
+        // Trim history if needed
+        if message_history.length() > max_history {
+            message_history = message_history.slice(
+                message_history.length() - max_history,
+                message_history.length()
+            )
+        }
+    }
+    
+    fun get_recent_messages(count: Int) -> Array<ChatMessage> {
+        let start = max(0, message_history.length() - count)
+        return message_history.slice(start, message_history.length())
+    }
+    
+    fun find_message(message_id: String) -> ChatMessage? {
+        for message in message_history {
+            if message.id == message_id {
+                return message
+            }
+        }
+        return null
+    }
+    
+    fun is_authorized(user_id: String) -> Bool {
+        // Simplified authorization check
+        return admin_users.contains(user_id)
+    }
+    
+    fun is_message_spam(user_id: String, content: String) -> Bool {
+        // Simple spam detection
+        if content.length() > 1000 {
+            return true
+        }
+        
+        // Check for repeated characters
+        let prev_char = ''
+        let repeat_count = 0
+        for char in content {
+            if char == prev_char {
+                repeat_count = repeat_count + 1
+                if repeat_count > 10 {
+                    return true
+                }
+            } else {
+                repeat_count = 0
+                prev_char = char
+            }
+        }
+        
+        return false
+    }
+    
+    fun filter_content(content: String) -> String {
+        // Simple content filtering
+        // In production, would use more sophisticated filtering
+        let filtered = content.replace("badword", "***")
+        return filtered
+    }
+    
+    fun generate_message_id() -> String {
+        return room_id + "_" + time::now().to_string() + "_" + random(1000000).to_string()
+    }
+}
+
+// User actor representing a chat client
+actor ChatUser {
+    state user_id: String
+    state profile: UserProfile
+    state current_rooms: HashMap<String, ActorRef>
+    state message_buffer: Array<ChatMessage>
+    state connection_state: String  // "connected", "disconnected"
+    state typing_indicators: HashMap<String, Bool>
+    
+    new create(id: String, username: String, display: String) {
+        user_id = id
+        profile = UserProfile {
+            username: username,
+            display_name: display,
+            avatar_url: "/avatars/default.png",
+            status: "online",
+            joined_at: time::now(),
+            last_seen: time::now()
+        }
+        current_rooms = HashMap::new()
+        message_buffer = []
+        connection_state = "connected"
+        typing_indicators = HashMap::new()
+        
+        println("User " + display + " (" + username + ") connected")
+    }
+    
+    // Join a chat room
+    on JoinRoom(room: ActorRef, room_id: String) {
+        let result = ask(room, JoinRoom(user_id, self, profile)) timeout 2s
+        
+        if result.is_ok() {
+            current_rooms.put(room_id, room)
+            reply(Ok("Joined room"))
+        } else {
+            reply(result)
+        }
+    }
+    
+    // Leave a chat room
+    on LeaveRoom(room_id: String) {
+        if current_rooms.contains(room_id) {
+            let room = current_rooms.get(room_id)
+            send(room, LeaveRoom(user_id, profile))
+            current_rooms.remove(room_id)
+            reply(Ok("Left room"))
+        } else {
+            reply(Err("Not in room"))
+        }
+    }
+    
+    // Send a message
+    on SendMessage(room_id: String, content: String) {
+        if current_rooms.contains(room_id) {
+            let room = current_rooms.get(room_id)
+            let result = ask(room, SendMessage(user_id, content, "text")) timeout 2s
+            reply(result)
+        } else {
+            reply(Err("Not in room"))
+        }
+    }
+    
+    // Receive a message from a room
+    on ReceiveMessage(message: ChatMessage) {
+        message_buffer.push(message)
+        
+        // Limit buffer size
+        if message_buffer.length() > 1000 {
+            message_buffer = message_buffer.slice(500, 1000)
+        }
+        
+        // Process message (e.g., notifications, UI update)
+        process_incoming_message(message)
+    }
+    
+    // Receive message history
+    on ReceiveHistory(messages: Array<ChatMessage>) {
+        for message in messages {
+            message_buffer.push(message)
+        }
+    }
+    
+    // Handle message edits
+    on MessageEdited(message_id: String, new_content: String) {
+        for message in message_buffer {
+            if message.id == message_id {
+                message.content = new_content
+                break
+            }
+        }
+    }
+    
+    // Handle message deletions
+    on MessageDeleted(message_id: String) {
+        message_buffer = message_buffer.filter(|m| m.id != message_id)
+    }
+    
+    // Handle being kicked from a room
+    on Kicked(room_id: String, reason: String) {
+        current_rooms.remove(room_id)
+        println("Kicked from room " + room_id + ": " + reason)
+    }
+    
+    // Update typing status
+    on SetTyping(room_id: String, is_typing: Bool) {
+        typing_indicators.put(room_id, is_typing)
+        
+        if current_rooms.contains(room_id) {
+            let room = current_rooms.get(room_id)
+            send(room, UserTyping(user_id, is_typing))
+        }
+    }
+    
+    // Update user status
+    on SetStatus(new_status: String) {
+        profile.status = new_status
+        profile.last_seen = time::now()
+        
+        // Notify all rooms of status change
+        for (room_id, room) in current_rooms {
+            send(room, StatusUpdate(user_id, new_status))
+        }
+        
+        reply(Ok("Status updated"))
+    }
+    
+    // Get current messages
+    on GetMessages(room_id: String?, count: Int) {
+        if room_id != null {
+            let room_messages = message_buffer.filter(|m| m.room == room_id)
+            let recent = room_messages.slice(
+                max(0, room_messages.length() - count),
+                room_messages.length()
+            )
+            reply(recent)
+        } else {
+            let recent = message_buffer.slice(
+                max(0, message_buffer.length() - count),
+                message_buffer.length()
+            )
+            reply(recent)
+        }
+    }
+    
+    fun process_incoming_message(message: ChatMessage) {
+        // Handle notifications, mentions, etc.
+        if message.content.contains("@" + profile.username) {
+            // User was mentioned
+            println("[MENTION] " + message.sender + " in " + message.room + ": " + message.content)
+        }
+    }
+}
+
+// Chat server coordinator
+actor ChatServer {
+    state rooms: HashMap<String, ActorRef>
+    state users: HashMap<String, ActorRef>
+    state room_directory: HashMap<String, {name: String, is_private: Bool, member_count: Int}>
+    
+    new create() {
+        rooms = HashMap::new()
+        users = HashMap::new()
+        room_directory = HashMap::new()
+        
+        // Create default rooms
+        create_default_rooms()
+        
+        println("Chat server started")
+    }
+    
+    fun create_default_rooms() {
+        create_room("general", "General", false)
+        create_room("random", "Random", false)
+        create_room("tech", "Technology", false)
+        create_room("gaming", "Gaming", false)
+    }
+    
+    fun create_room(id: String, name: String, is_private: Bool) {
+        let room = spawn ChatRoom(id, name, is_private)
+        rooms.put(id, room)
+        room_directory.put(id, {
+            name: name,
+            is_private: is_private,
+            member_count: 0
+        })
+    }
+    
+    // Register a new user
+    on RegisterUser(username: String, display_name: String) {
+        let user_id = generate_user_id(username)
+        
+        if users.contains(user_id) {
+            reply(Err("Username already taken"))
+            return
+        }
+        
+        let user = spawn ChatUser(user_id, username, display_name)
+        users.put(user_id, user)
+        
+        reply(Ok({
+            user_id: user_id,
+            user_ref: user
+        }))
+    }
+    
+    // Create a new room
+    on CreateRoom(creator_id: String, room_name: String, is_private: Bool) {
+        let room_id = generate_room_id(room_name)
+        
+        if rooms.contains(room_id) {
+            reply(Err("Room already exists"))
+            return
+        }
+        
+        create_room(room_id, room_name, is_private)
+        
+        reply(Ok({
+            room_id: room_id,
+            room_ref: rooms.get(room_id)
+        }))
+    }
+    
+    // Get list of public rooms
+    on GetRoomList() {
+        let public_rooms = []
+        
+        for (room_id, info) in room_directory {
+            if !info.is_private {
+                public_rooms.push({
+                    id: room_id,
+                    name: info.name,
+                    member_count: info.member_count
+                })
+            }
+        }
+        
+        reply(public_rooms)
+    }
+    
+    // Get room reference
+    on GetRoom(room_id: String) {
+        if rooms.contains(room_id) {
+            reply(Ok(rooms.get(room_id)))
+        } else {
+            reply(Err("Room not found"))
+        }
+    }
+    
+    fun generate_user_id(username: String) -> String {
+        return "user_" + username.to_lowercase()
+    }
+    
+    fun generate_room_id(room_name: String) -> String {
+        return "room_" + room_name.to_lowercase().replace(" ", "_")
+    }
+}
+
+// Main demonstration
+actor Main {
+    new create() {
+        println("=== GAL Chat Application ===\n")
+        
+        // Start chat server
+        let server = spawn ChatServer()
+        
+        // Register users
+        let alice_result = ask(server, RegisterUser("alice", "Alice")) timeout 1s
+        let bob_result = ask(server, RegisterUser("bob", "Bob")) timeout 1s
+        let charlie_result = ask(server, RegisterUser("charlie", "Charlie")) timeout 1s
+        
+        let alice = alice_result.unwrap().user_ref
+        let bob = bob_result.unwrap().user_ref
+        let charlie = charlie_result.unwrap().user_ref
+        
+        // Get general room
+        let general_room = ask(server, GetRoom("general")) timeout 1s
+        let general = general_room.unwrap()
+        
+        // Users join general room
+        send(alice, JoinRoom(general, "general"))
+        send(bob, JoinRoom(general, "general"))
+        send(charlie, JoinRoom(general, "general"))
+        
+        time::sleep(500ms)
+        
+        // Simulate conversation
+        send(alice, SendMessage("general", "Hello everyone!"))
+        time::sleep(200ms)
+        
+        send(bob, SendMessage("general", "Hey Alice! How are you?"))
+        time::sleep(200ms)
+        
+        send(charlie, SendMessage("general", "Hi folks!"))
+        time::sleep(200ms)
+        
+        send(alice, SendMessage("general", "Doing great! Anyone up for discussing GAL?"))
+        time::sleep(200ms)
+        
+        send(bob, SendMessage("general", "Sure! I love the actor model"))
+        time::sleep(200ms)
+        
+        // Charlie creates a private room
+        let private_room = ask(server, CreateRoom("charlie", "Secret Club", true)) timeout 1s
+        if private_room.is_ok() {
+            println("\nCharlie created a private room: Secret Club")
+        }
+        
+        // Get message history
+        time::sleep(500ms)
+        let alice_messages = ask(alice, GetMessages("general", 10)) timeout 1s
+        println("\nAlice's message history:")
+        for message in alice_messages {
+            println("  [" + message.sender + "]: " + message.content)
+        }
+        
+        // Update status
+        send(bob, SetStatus("away"))
+        
+        // Get room list
+        let rooms = ask(server, GetRoomList()) timeout 1s
+        println("\nAvailable rooms:")
+        for room in rooms {
+            println("  - " + room.name + " (" + room.member_count.to_string() + " members)")
+        }
+        
+        println("\n=== Chat Application Demo Complete ===")
+    }
+}
+
+// Helper functions
+fun max(a: Int, b: Int) -> Int {
+    if a > b { return a } else { return b }
+}
+
+fun min(a: Int, b: Int) -> Int {
+    if a < b { return a } else { return b }
+}
+
+fun random(max: Int) -> Int {
+    // Simplified random number generation
+    return (time::now() * 31) % max
+}

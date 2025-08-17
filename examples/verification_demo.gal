@@ -1,0 +1,165 @@
+// verification_demo.gal - Formal verification features
+
+// A bank account with formal contracts
+actor BankAccount {
+    state balance: Float
+    state owner: String
+    state transactions: Array<Transaction>
+    
+    // Class invariant - must always be true
+    invariant balance >= 0.0
+    invariant transactions.length() >= 0
+    
+    new create(initial_owner: String, initial_balance: Float)
+        requires initial_balance >= 0.0
+        ensures self.balance == initial_balance
+        ensures self.owner == initial_owner
+    {
+        owner = initial_owner
+        balance = initial_balance
+        transactions = []
+        println("Account created for " + owner + " with balance: " + balance)
+    }
+    
+    on Deposit(amount: Float)
+        requires amount > 0.0
+        ensures self.balance == old(self.balance) + amount
+        ensures self.transactions.length() == old(self.transactions.length()) + 1
+    {
+        balance = balance + amount
+        transactions.push(Transaction::Deposit(amount, now()))
+        println("Deposited: " + amount)
+        reply(Ok(balance))
+    }
+    
+    on Withdraw(amount: Float)
+        requires amount > 0.0
+        requires self.balance >= amount
+        ensures self.balance == old(self.balance) - amount
+        ensures self.transactions.length() == old(self.transactions.length()) + 1
+    {
+        if balance >= amount {
+            balance = balance - amount
+            transactions.push(Transaction::Withdrawal(amount, now()))
+            println("Withdrew: " + amount)
+            reply(Ok(balance))
+        } else {
+            reply(Err("Insufficient funds"))
+        }
+    }
+    
+    on Transfer(to_account: ActorRef, amount: Float)
+        requires amount > 0.0
+        requires self.balance >= amount
+        ensures self.balance == old(self.balance) - amount
+    {
+        if balance >= amount {
+            // Atomic transfer with two-phase commit
+            atomic {
+                balance = balance - amount
+                send(to_account, Deposit(amount))
+                transactions.push(Transaction::Transfer(amount, to_account, now()))
+            }
+            reply(Ok("Transfer completed"))
+        } else {
+            reply(Err("Insufficient funds"))
+        }
+    }
+    
+    on GetBalance
+        ensures result == self.balance
+    {
+        reply(balance)
+    }
+    
+    on GetStatement {
+        reply(Statement {
+            owner: owner,
+            balance: balance,
+            transactions: transactions.clone()
+        })
+    }
+}
+
+// Transaction type
+enum Transaction {
+    Deposit(Float, Time)
+    Withdrawal(Float, Time)
+    Transfer(Float, ActorRef, Time)
+}
+
+// Statement type
+struct Statement {
+    owner: String
+    balance: Float
+    transactions: Array<Transaction>
+}
+
+// Verified function with contracts
+fn calculate_interest(principal: Float, rate: Float, time: Float) -> Float
+    requires principal >= 0.0
+    requires rate >= 0.0 && rate <= 1.0
+    requires time >= 0.0
+    ensures result >= principal
+    ensures result == principal * (1.0 + rate * time)
+{
+    principal * (1.0 + rate * time)
+}
+
+// Property-based test
+@property_test
+property account_balance_never_negative {
+    given account: BankAccount = arbitrary()
+    given operations: Array<Operation> = arbitrary(1..100)
+    
+    when {
+        for op in operations {
+            match op {
+                Deposit(amt) if amt > 0.0 => 
+                    send(account, Deposit(amt))
+                Withdraw(amt) if amt > 0.0 && amt <= account.balance =>
+                    send(account, Withdraw(amt))
+                _ => skip
+            }
+        }
+    }
+    
+    then {
+        let final_balance = ask(account, GetBalance)
+        assert(final_balance >= 0.0, "Balance must never be negative")
+    }
+}
+
+// Main demonstration
+actor Main {
+    new create() {
+        println("Formal Verification Demo")
+        println("========================")
+        
+        // Create verified accounts
+        let alice = spawn BankAccount("Alice", 1000.0)
+        let bob = spawn BankAccount("Bob", 500.0)
+        
+        // Perform verified operations
+        send(alice, Deposit(200.0))
+        send(alice, Withdraw(150.0))
+        send(alice, Transfer(bob, 300.0))
+        
+        // Calculate interest with verified function
+        let interest = calculate_interest(1000.0, 0.05, 1.0)
+        println("Interest calculated: " + interest)
+        
+        // Get final balances
+        let alice_balance = ask(alice, GetBalance) timeout 1s
+        let bob_balance = ask(bob, GetBalance) timeout 1s
+        
+        println("Alice final balance: " + alice_balance)
+        println("Bob final balance: " + bob_balance)
+        
+        // Verify invariants held throughout
+        verify_invariants(alice)
+        verify_invariants(bob)
+        
+        println("All verification checks passed!")
+    }
+}

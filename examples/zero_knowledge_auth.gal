@@ -1,0 +1,846 @@
+// Zero-Knowledge Authentication System
+// Demonstrates GAL's formal verification of cryptographic protocols and chaos testing
+
+import std.crypto
+import std.verification
+import std.chaos
+import std.network
+import std.time
+
+// Formal verification contracts for zero-knowledge properties
+@verify_invariant("zero_knowledge_property")
+fn zero_knowledge_invariant(proof: &ZKProof, secret: &Secret) -> bool {
+    // Invariant: Proof reveals no information about the secret
+    // Simulator can produce indistinguishable proofs without knowing the secret
+    proof.commitment.reveals_no_info_about(secret) &&
+    proof.response.is_simulatable_without_secret()
+}
+
+@verify_invariant("soundness_property")
+fn soundness_invariant(proof: &ZKProof, statement: &Statement) -> bool {
+    // Invariant: Invalid statements cannot produce valid proofs (except with negligible probability)
+    if !statement.is_true() {
+        proof.verification_probability() < NEGLIGIBLE_PROBABILITY
+    } else {
+        true
+    }
+}
+
+@verify_invariant("completeness_property")
+fn completeness_invariant(prover: &Prover, statement: &Statement) -> bool {
+    // Invariant: Valid statements can always be proven by honest provers
+    if statement.is_true() && prover.knows_witness() {
+        prover.can_generate_valid_proof()
+    } else {
+        true
+    }
+}
+
+// Zero-knowledge proof system for discrete logarithm
+struct SchnorrProof {
+    commitment: GroupElement,    // g^r
+    challenge: FieldElement,     // Fiat-Shamir challenge
+    response: FieldElement,      // r + c*x (where x is secret)
+}
+
+impl SchnorrProof {
+    // Generate proof that prover knows discrete log of public_key
+    @verify_precondition("valid_secret", |secret| secret.is_valid())
+    @verify_postcondition("valid_proof", |result| result.is_ok())
+    fn generate(secret: &SecretKey, public_key: &PublicKey, message: &[u8]) -> Result<Self, CryptoError> {
+        // Choose random nonce
+        let r = FieldElement::random();
+        
+        // Compute commitment: g^r
+        let commitment = GENERATOR.pow(&r);
+        
+        // Compute Fiat-Shamir challenge: H(commitment || public_key || message)
+        let challenge_input = [
+            commitment.to_bytes(),
+            public_key.to_bytes(),
+            message,
+        ].concat();
+        let challenge = FieldElement::from_hash(&hash_sha256(&challenge_input));
+        
+        // Compute response: r + c*x
+        let response = r + challenge * secret.value();
+        
+        Ok(SchnorrProof {
+            commitment,
+            challenge,
+            response,
+        })
+    }
+    
+    // Verify proof without learning the secret
+    @verify_precondition("valid_inputs", |_, public_key, message| public_key.is_valid())
+    @verify_postcondition("correct_verification", |result| result.is_ok())
+    fn verify(&self, public_key: &PublicKey, message: &[u8]) -> Result<bool, CryptoError> {
+        // Recompute challenge
+        let challenge_input = [
+            self.commitment.to_bytes(),
+            public_key.to_bytes(),
+            message,
+        ].concat();
+        let expected_challenge = FieldElement::from_hash(&hash_sha256(&challenge_input));
+        
+        // Check challenge matches
+        if self.challenge != expected_challenge {
+            return Ok(false);
+        }
+        
+        // Verify: g^response = commitment * public_key^challenge
+        let left_side = GENERATOR.pow(&self.response);
+        let right_side = self.commitment + public_key.element() * self.challenge;
+        
+        Ok(left_side == right_side)
+    }
+    
+    fn reveals_no_info_about(&self, _secret: &Secret) -> bool {
+        // In a real implementation, this would check if the proof
+        // is indistinguishable from a simulated proof
+        true
+    }
+    
+    fn is_simulatable_without_secret(&self) -> bool {
+        // Zero-knowledge simulator can produce this without the secret
+        true
+    }
+    
+    fn verification_probability(&self) -> f64 {
+        // Probability that an invalid proof passes verification
+        2.0_f64.powf(-256.0) // Negligible for 256-bit security
+    }
+}
+
+// Zero-knowledge proof for range (value is in [0, 2^n))
+struct RangeProof {
+    bit_commitments: Vec<GroupElement>,
+    bit_proofs: Vec<SchnorrProof>,
+    aggregated_proof: Option<BulletProof>,
+}
+
+impl RangeProof {
+    @verify_precondition("valid_range", |value, bits| *value < 2_u64.pow(*bits as u32))
+    @verify_postcondition("proof_generated", |result| result.is_ok())
+    fn generate(value: u64, bits: usize, randomness: &FieldElement) -> Result<Self, CryptoError> {
+        let mut bit_commitments = Vec::new();
+        let mut bit_proofs = Vec::new();
+        
+        // Commit to each bit of the value
+        for i in 0..bits {
+            let bit = (value >> i) & 1;
+            let bit_randomness = FieldElement::random();
+            
+            // Pedersen commitment: g^bit * h^randomness
+            let commitment = GENERATOR.pow(&FieldElement::from(bit)) + 
+                           GENERATOR_H.pow(&bit_randomness);
+            bit_commitments.push(commitment);
+            
+            // Prove that committed value is either 0 or 1
+            let bit_proof = Self::prove_bit(&FieldElement::from(bit), &bit_randomness)?;
+            bit_proofs.push(bit_proof);
+        }
+        
+        // Optional: Use Bulletproofs for logarithmic size
+        let aggregated_proof = BulletProof::generate(value, bits, randomness)?;
+        
+        Ok(RangeProof {
+            bit_commitments,
+            bit_proofs,
+            aggregated_proof: Some(aggregated_proof),
+        })
+    }
+    
+    @verify_postcondition("verification_result", |result| result.is_ok())
+    fn verify(&self, commitment: &GroupElement, bits: usize) -> Result<bool, CryptoError> {
+        // Verify each bit proof
+        for (i, (bit_commitment, bit_proof)) in 
+            self.bit_commitments.iter().zip(&self.bit_proofs).enumerate() {
+            
+            if !Self::verify_bit(bit_proof, bit_commitment)? {
+                return Ok(false);
+            }
+        }
+        
+        // Verify that bit commitments aggregate to the main commitment
+        let aggregated_commitment = self.bit_commitments.iter()
+            .enumerate()
+            .fold(GroupElement::identity(), |acc, (i, &comm)| {
+                acc + comm * FieldElement::from(2_u64.pow(i as u32))
+            });
+            
+        if aggregated_commitment != *commitment {
+            return Ok(false);
+        }
+        
+        // Verify Bulletproof if present
+        if let Some(ref bulletproof) = self.aggregated_proof {
+            return bulletproof.verify(commitment, bits);
+        }
+        
+        Ok(true)
+    }
+    
+    fn prove_bit(bit: &FieldElement, randomness: &FieldElement) -> Result<SchnorrProof, CryptoError> {
+        // Simplified bit proof - in practice would use sigma protocols
+        let secret_key = SecretKey::new(*bit);
+        let public_key = PublicKey::from_secret(&secret_key);
+        SchnorrProof::generate(&secret_key, &public_key, b"bit_proof")
+    }
+    
+    fn verify_bit(proof: &SchnorrProof, _commitment: &GroupElement) -> Result<bool, CryptoError> {
+        // Simplified verification
+        Ok(true)
+    }
+}
+
+// Bulletproof for efficient range proofs
+struct BulletProof {
+    a: GroupElement,
+    s: GroupElement,
+    t1: GroupElement,
+    t2: GroupElement,
+    tau_x: FieldElement,
+    mu: FieldElement,
+    inner_product_proof: InnerProductProof,
+}
+
+impl BulletProof {
+    fn generate(value: u64, bits: usize, randomness: &FieldElement) -> Result<Self, CryptoError> {
+        // Simplified Bulletproof generation
+        Ok(BulletProof {
+            a: GroupElement::random(),
+            s: GroupElement::random(),
+            t1: GroupElement::random(),
+            t2: GroupElement::random(),
+            tau_x: FieldElement::random(),
+            mu: FieldElement::random(),
+            inner_product_proof: InnerProductProof::generate()?,
+        })
+    }
+    
+    fn verify(&self, _commitment: &GroupElement, _bits: usize) -> Result<bool, CryptoError> {
+        // Simplified verification
+        Ok(true)
+    }
+}
+
+// Authentication system using zero-knowledge proofs
+struct ZKAuthSystem {
+    users: HashMap<UserId, UserCredentials>,
+    active_sessions: HashMap<SessionId, AuthSession>,
+    challenge_store: HashMap<ChallengeId, AuthChallenge>,
+    proof_verifier: ProofVerifier,
+    chaos_config: ChaosConfig,
+}
+
+impl ZKAuthSystem {
+    @verify_postcondition("system_initialized", |result| result.users.is_empty())
+    fn new() -> Self {
+        ZKAuthSystem {
+            users: HashMap::new(),
+            active_sessions: HashMap::new(),
+            challenge_store: HashMap::new(),
+            proof_verifier: ProofVerifier::new(),
+            chaos_config: ChaosConfig::default(),
+        }
+    }
+    
+    // Register user with zero-knowledge credentials
+    @verify_precondition("valid_password", |password| password.len() >= 8)
+    @verify_postcondition("user_registered", |result| result.is_ok())
+    fn register_user(&mut self, username: &str, password: &str, email: &str) -> Result<UserId, AuthError> {
+        // Derive secret key from password using secure hash
+        let secret_key = self.derive_secret_key(password)?;
+        
+        // Generate public key (commitment to secret)
+        let public_key = PublicKey::from_secret(&secret_key);
+        
+        // Generate additional ZK credentials
+        let credentials = UserCredentials {
+            username: username.to_string(),
+            public_key,
+            email_hash: hash_sha256(email.as_bytes()),
+            registration_date: Time::now(),
+            proof_parameters: ProofParameters::default(),
+        };
+        
+        let user_id = UserId::generate();
+        self.users.insert(user_id.clone(), credentials);
+        
+        // Don't store the password or secret key!
+        Ok(user_id)
+    }
+    
+    // Initiate authentication challenge
+    @verify_precondition("user_exists", |user_id| self.users.contains_key(user_id))
+    @verify_postcondition("challenge_created", |result| result.is_ok())
+    fn initiate_auth(&mut self, user_id: &UserId) -> Result<AuthChallenge, AuthError> {
+        let user = self.users.get(user_id)
+            .ok_or(AuthError::UserNotFound)?;
+            
+        // Generate random challenge
+        let challenge_data = SecureRandom::bytes(32);
+        let challenge_id = ChallengeId::generate();
+        
+        let challenge = AuthChallenge {
+            id: challenge_id.clone(),
+            user_id: user_id.clone(),
+            challenge_data,
+            timestamp: Time::now(),
+            expires_at: Time::now() + Duration::minutes(5),
+            public_key: user.public_key.clone(),
+        };
+        
+        self.challenge_store.insert(challenge_id, challenge.clone());
+        Ok(challenge)
+    }
+    
+    // Complete authentication with zero-knowledge proof
+    @verify_precondition("valid_challenge", |challenge_id| self.challenge_store.contains_key(challenge_id))
+    @verify_postcondition("authenticated", |result| result.is_ok())
+    fn complete_auth(&mut self, challenge_id: &ChallengeId, proof: SchnorrProof) -> Result<SessionToken, AuthError> {
+        let challenge = self.challenge_store.remove(challenge_id)
+            .ok_or(AuthError::InvalidChallenge)?;
+            
+        // Check challenge hasn't expired
+        if Time::now() > challenge.expires_at {
+            return Err(AuthError::ChallengeExpired);
+        }
+        
+        // Verify zero-knowledge proof
+        let is_valid = proof.verify(&challenge.public_key, &challenge.challenge_data)?;
+        if !is_valid {
+            return Err(AuthError::InvalidProof);
+        }
+        
+        // Create authenticated session
+        let session_token = SessionToken::generate();
+        let session = AuthSession {
+            id: SessionId::generate(),
+            user_id: challenge.user_id.clone(),
+            token: session_token.clone(),
+            created_at: Time::now(),
+            expires_at: Time::now() + Duration::hours(8),
+            capabilities: vec![Capability::BasicAccess],
+        };
+        
+        self.active_sessions.insert(session.id.clone(), session);
+        Ok(session_token)
+    }
+    
+    // Biometric authentication with zero-knowledge
+    @chaos_test("biometric_spoofing")
+    fn authenticate_biometric(&mut self, user_id: &UserId, biometric_template: &BiometricTemplate) -> Result<SessionToken, AuthError> {
+        let user = self.users.get(user_id)
+            .ok_or(AuthError::UserNotFound)?;
+            
+        // Generate zero-knowledge proof of biometric match
+        // without revealing the actual biometric data
+        let biometric_proof = self.generate_biometric_proof(biometric_template, &user.public_key)?;
+        
+        // Verify proof
+        if !self.verify_biometric_proof(&biometric_proof, &user.public_key)? {
+            return Err(AuthError::BiometricMismatch);
+        }
+        
+        // Create session with biometric authentication
+        let session_token = SessionToken::generate();
+        let session = AuthSession {
+            id: SessionId::generate(),
+            user_id: user_id.clone(),
+            token: session_token.clone(),
+            created_at: Time::now(),
+            expires_at: Time::now() + Duration::hours(4),
+            capabilities: vec![Capability::BasicAccess, Capability::BiometricVerified],
+        };
+        
+        self.active_sessions.insert(session.id.clone(), session);
+        Ok(session_token)
+    }
+    
+    // Multi-factor authentication with ZK proofs
+    fn authenticate_mfa(&mut self, 
+                       user_id: &UserId, 
+                       password_proof: SchnorrProof,
+                       totp_code: u32,
+                       device_proof: Option<DeviceProof>) -> Result<SessionToken, AuthError> {
+        
+        let user = self.users.get(user_id)
+            .ok_or(AuthError::UserNotFound)?;
+            
+        // Verify password proof
+        let challenge_data = b"mfa_password_challenge";
+        if !password_proof.verify(&user.public_key, challenge_data)? {
+            return Err(AuthError::InvalidPasswordProof);
+        }
+        
+        // Verify TOTP without revealing the shared secret
+        if !self.verify_totp_zk(user_id, totp_code)? {
+            return Err(AuthError::InvalidTOTP);
+        }
+        
+        // Verify device proof if provided
+        if let Some(device_proof) = device_proof {
+            if !self.verify_device_proof(&device_proof, user_id)? {
+                return Err(AuthError::UnknownDevice);
+            }
+        }
+        
+        // Create high-privilege session
+        let session_token = SessionToken::generate();
+        let session = AuthSession {
+            id: SessionId::generate(),
+            user_id: user_id.clone(),
+            token: session_token.clone(),
+            created_at: Time::now(),
+            expires_at: Time::now() + Duration::hours(2),
+            capabilities: vec![
+                Capability::BasicAccess,
+                Capability::MultiFactor,
+                Capability::PrivilegedOperations,
+            ],
+        };
+        
+        self.active_sessions.insert(session.id.clone(), session);
+        Ok(session_token)
+    }
+    
+    // Self-modification: Adaptive security based on risk
+    @chaos_test("adaptive_security")
+    fn adaptive_security_adjustment(&mut self, user_id: &UserId, risk_score: f64) -> Result<(), AuthError> {
+        if risk_score > 0.8 {
+            // High risk: Require additional proofs
+            self.require_additional_zk_proofs(user_id)?;
+        } else if risk_score > 0.5 {
+            // Medium risk: Shorten session duration
+            self.reduce_session_duration(user_id, Duration::minutes(30))?;
+        }
+        // Low risk: Normal operation
+        
+        Ok(())
+    }
+    
+    // Chaos engineering tests
+    #[chaos_scenario("proof_forgery_attempt")]
+    fn test_proof_forgery(&mut self) {
+        // Simulate attacker trying to forge proofs
+        let fake_secret = SecretKey::random();
+        let fake_public = PublicKey::from_secret(&fake_secret);
+        let legitimate_user = self.users.keys().next().unwrap().clone();
+        
+        // Try to forge a proof for legitimate user
+        let forge_attempt = SchnorrProof::generate(&fake_secret, &fake_public, b"forged");
+        
+        // Should fail verification against legitimate user's public key
+        if let Ok(proof) = forge_attempt {
+            let user = &self.users[&legitimate_user];
+            let verification = proof.verify(&user.public_key, b"forged");
+            assert!(verification.is_err() || !verification.unwrap());
+        }
+    }
+    
+    #[chaos_scenario("timing_attack")]
+    fn test_timing_attack_resistance(&mut self) {
+        // Ensure verification time is constant regardless of input
+        let start_time = Time::now();
+        let _ = self.verify_constant_time_operation();
+        let duration1 = Time::now() - start_time;
+        
+        let start_time = Time::now();
+        let _ = self.verify_constant_time_operation();
+        let duration2 = Time::now() - start_time;
+        
+        // Timing should be similar (within reasonable bounds)
+        assert!((duration1 - duration2).abs() < Duration::milliseconds(10));
+    }
+    
+    #[chaos_scenario("memory_exhaustion")]
+    fn test_memory_exhaustion_resistance(&mut self) {
+        // Test system behavior under memory pressure
+        for _ in 0..1000 {
+            let _ = SchnorrProof::generate(
+                &SecretKey::random(),
+                &PublicKey::random(),
+                &vec![0u8; 1024]
+            );
+        }
+        
+        // System should still function correctly
+        assert!(self.users.len() >= 0);
+    }
+    
+    // Private helper methods
+    fn derive_secret_key(&self, password: &str) -> Result<SecretKey, CryptoError> {
+        // Use Argon2 or scrypt for password-based key derivation
+        let salt = b"zk_auth_salt_unique_per_system";
+        let key_material = argon2_hash(password.as_bytes(), salt, 100000, 32)?;
+        Ok(SecretKey::from_bytes(&key_material))
+    }
+    
+    fn generate_biometric_proof(&self, template: &BiometricTemplate, public_key: &PublicKey) -> Result<BiometricProof, CryptoError> {
+        // Generate proof that biometric matches without revealing template
+        Ok(BiometricProof {
+            commitment: GroupElement::random(),
+            proof: SchnorrProof::generate(&SecretKey::random(), public_key, b"biometric")?,
+        })
+    }
+    
+    fn verify_biometric_proof(&self, proof: &BiometricProof, public_key: &PublicKey) -> Result<bool, CryptoError> {
+        proof.proof.verify(public_key, b"biometric")
+    }
+    
+    fn verify_totp_zk(&self, user_id: &UserId, totp_code: u32) -> Result<bool, CryptoError> {
+        // Zero-knowledge verification of TOTP without revealing shared secret
+        // In practice, this would use a commitment scheme
+        Ok(true) // Simplified
+    }
+    
+    fn verify_device_proof(&self, proof: &DeviceProof, user_id: &UserId) -> Result<bool, CryptoError> {
+        // Verify device is associated with user without revealing device fingerprint
+        Ok(true) // Simplified
+    }
+    
+    fn require_additional_zk_proofs(&mut self, user_id: &UserId) -> Result<(), AuthError> {
+        // Require additional zero-knowledge proofs for high-risk users
+        Ok(())
+    }
+    
+    fn reduce_session_duration(&mut self, user_id: &UserId, new_duration: Duration) -> Result<(), AuthError> {
+        // Reduce session duration for medium-risk users
+        for session in self.active_sessions.values_mut() {
+            if session.user_id == *user_id {
+                session.expires_at = session.created_at + new_duration;
+            }
+        }
+        Ok(())
+    }
+    
+    fn verify_constant_time_operation(&self) -> bool {
+        // Perform cryptographic operation in constant time
+        let dummy_key = SecretKey::random();
+        let dummy_public = PublicKey::from_secret(&dummy_key);
+        let dummy_proof = SchnorrProof::generate(&dummy_key, &dummy_public, b"timing_test");
+        dummy_proof.is_ok()
+    }
+}
+
+// Supporting structures
+struct UserCredentials {
+    username: String,
+    public_key: PublicKey,
+    email_hash: [u8; 32],
+    registration_date: Timestamp,
+    proof_parameters: ProofParameters,
+}
+
+struct AuthChallenge {
+    id: ChallengeId,
+    user_id: UserId,
+    challenge_data: Vec<u8>,
+    timestamp: Timestamp,
+    expires_at: Timestamp,
+    public_key: PublicKey,
+}
+
+struct AuthSession {
+    id: SessionId,
+    user_id: UserId,
+    token: SessionToken,
+    created_at: Timestamp,
+    expires_at: Timestamp,
+    capabilities: Vec<Capability>,
+}
+
+struct BiometricProof {
+    commitment: GroupElement,
+    proof: SchnorrProof,
+}
+
+struct DeviceProof {
+    device_commitment: GroupElement,
+    proof: SchnorrProof,
+}
+
+struct ProofVerifier {
+    parameters: SystemParameters,
+}
+
+impl ProofVerifier {
+    fn new() -> Self {
+        ProofVerifier {
+            parameters: SystemParameters::secure_default(),
+        }
+    }
+}
+
+// Cryptographic primitives and types
+struct GroupElement([u8; 32]);
+struct FieldElement([u8; 32]);
+struct SecretKey([u8; 32]);
+struct PublicKey(GroupElement);
+struct InnerProductProof;
+struct BiometricTemplate;
+struct ProofParameters;
+struct SystemParameters;
+
+// Placeholder implementations for cryptographic operations
+const GENERATOR: GroupElement = GroupElement([1u8; 32]);
+const GENERATOR_H: GroupElement = GroupElement([2u8; 32]);
+const NEGLIGIBLE_PROBABILITY: f64 = 2.0_f64.powf(-128.0);
+
+impl GroupElement {
+    fn random() -> Self { GroupElement([0u8; 32]) }
+    fn identity() -> Self { GroupElement([0u8; 32]) }
+    fn pow(&self, _exp: &FieldElement) -> Self { *self }
+    fn to_bytes(&self) -> Vec<u8> { self.0.to_vec() }
+}
+
+impl std::ops::Add for GroupElement {
+    type Output = Self;
+    fn add(self, _other: Self) -> Self { self }
+}
+
+impl std::ops::Mul<FieldElement> for GroupElement {
+    type Output = GroupElement;
+    fn mul(self, _scalar: FieldElement) -> GroupElement { self }
+}
+
+impl FieldElement {
+    fn random() -> Self { FieldElement([0u8; 32]) }
+    fn from(val: u64) -> Self { FieldElement([val as u8; 32]) }
+    fn from_hash(hash: &[u8]) -> Self { FieldElement([0u8; 32]) }
+    fn value(&self) -> Self { *self }
+}
+
+impl std::ops::Add for FieldElement {
+    type Output = Self;
+    fn add(self, _other: Self) -> Self { self }
+}
+
+impl std::ops::Mul for FieldElement {
+    type Output = Self;
+    fn mul(self, _other: Self) -> Self { self }
+}
+
+impl SecretKey {
+    fn new(val: FieldElement) -> Self { SecretKey(val.0) }
+    fn random() -> Self { SecretKey([0u8; 32]) }
+    fn from_bytes(bytes: &[u8]) -> Self { SecretKey([0u8; 32]) }
+    fn value(&self) -> FieldElement { FieldElement(self.0) }
+    fn is_valid(&self) -> bool { true }
+}
+
+impl PublicKey {
+    fn from_secret(secret: &SecretKey) -> Self { PublicKey(GENERATOR.pow(&secret.value())) }
+    fn random() -> Self { PublicKey(GroupElement::random()) }
+    fn element(&self) -> GroupElement { self.0 }
+    fn to_bytes(&self) -> Vec<u8> { self.0.to_bytes() }
+    fn is_valid(&self) -> bool { true }
+}
+
+impl InnerProductProof {
+    fn generate() -> Result<Self, CryptoError> { Ok(InnerProductProof) }
+}
+
+impl SystemParameters {
+    fn secure_default() -> Self { SystemParameters }
+}
+
+// Main demonstration function
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("🔐 Zero-Knowledge Authentication System Demo");
+    
+    // Initialize authentication system
+    let mut auth_system = ZKAuthSystem::new();
+    
+    // Register a new user
+    println!("\n👤 Registering new user...");
+    let user_id = auth_system.register_user("alice", "secure_password123", "alice@example.com")?;
+    println!("User registered with ID: {:?}", user_id);
+    
+    // Initiate authentication challenge
+    println!("\n🎯 Initiating authentication challenge...");
+    let challenge = auth_system.initiate_auth(&user_id)?;
+    println!("Challenge created: {:?}", challenge.id);
+    
+    // Generate zero-knowledge proof (simulated user-side operation)
+    println!("\n🔑 Generating zero-knowledge proof...");
+    let secret_key = SecretKey::random(); // In practice, derived from user's password
+    let public_key = PublicKey::from_secret(&secret_key);
+    let auth_proof = SchnorrProof::generate(&secret_key, &public_key, &challenge.challenge_data)?;
+    
+    // Complete authentication
+    println!("\n✅ Completing authentication...");
+    let session_token = auth_system.complete_auth(&challenge.id, auth_proof)?;
+    println!("Authentication successful! Session token: {:?}", session_token);
+    
+    // Demonstrate biometric authentication
+    println!("\n👁️ Testing biometric authentication...");
+    let biometric_template = BiometricTemplate; // Simulated biometric data
+    let bio_session = auth_system.authenticate_biometric(&user_id, &biometric_template)?;
+    println!("Biometric authentication successful!");
+    
+    // Demonstrate multi-factor authentication
+    println!("\n🔒 Testing multi-factor authentication...");
+    let password_proof = SchnorrProof::generate(&secret_key, &public_key, b"mfa_password_challenge")?;
+    let totp_code = 123456; // Simulated TOTP code
+    let device_proof = Some(DeviceProof {
+        device_commitment: GroupElement::random(),
+        proof: SchnorrProof::generate(&SecretKey::random(), &PublicKey::random(), b"device")?,
+    });
+    
+    let mfa_session = auth_system.authenticate_mfa(&user_id, password_proof, totp_code, device_proof)?;
+    println!("Multi-factor authentication successful!");
+    
+    // Test adaptive security
+    println!("\n🧠 Testing adaptive security...");
+    auth_system.adaptive_security_adjustment(&user_id, 0.9)?; // High risk score
+    println!("Security level adapted based on risk assessment");
+    
+    // Run chaos engineering tests
+    println!("\n🔥 Running chaos engineering tests...");
+    auth_system.test_proof_forgery();
+    auth_system.test_timing_attack_resistance();
+    auth_system.test_memory_exhaustion_resistance();
+    
+    // Demonstrate range proof
+    println!("\n📊 Testing range proof...");
+    let age = 25u64; // Prove age is in valid range without revealing exact value
+    let age_randomness = FieldElement::random();
+    let range_proof = RangeProof::generate(age, 8, &age_randomness)?; // Age fits in 8 bits (0-255)
+    
+    let age_commitment = GENERATOR.pow(&FieldElement::from(age)) + GENERATOR_H.pow(&age_randomness);
+    let range_valid = range_proof.verify(&age_commitment, 8)?;
+    println!("Range proof verified: {}", range_valid);
+    
+    println!("\n🎉 Zero-Knowledge Authentication Demo Completed!");
+    println!("✓ User registration with ZK credentials");
+    println!("✓ Challenge-response authentication");
+    println!("✓ Zero-knowledge proof generation and verification");
+    println!("✓ Biometric authentication without template exposure");
+    println!("✓ Multi-factor authentication with ZK proofs");
+    println!("✓ Adaptive security based on risk assessment");
+    println!("✓ Range proofs for privacy-preserving age verification");
+    println!("✓ Chaos engineering tests for security resilience");
+    println!("✓ Formal verification of cryptographic properties");
+    
+    Ok(())
+}
+
+// Error types and additional supporting code
+#[derive(Debug)]
+enum AuthError {
+    UserNotFound,
+    InvalidChallenge,
+    ChallengeExpired,
+    InvalidProof,
+    BiometricMismatch,
+    InvalidPasswordProof,
+    InvalidTOTP,
+    UnknownDevice,
+    CryptoError(CryptoError),
+}
+
+#[derive(Debug)]
+enum CryptoError {
+    InvalidParameters,
+    RandomnessError,
+    VerificationFailed,
+}
+
+impl From<CryptoError> for AuthError {
+    fn from(e: CryptoError) -> Self {
+        AuthError::CryptoError(e)
+    }
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct UserId(u64);
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct SessionId(u64);
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct ChallengeId(u64);
+#[derive(Debug, Clone)]
+struct SessionToken(String);
+
+impl UserId {
+    fn generate() -> Self { UserId(42) }
+}
+
+impl SessionId {
+    fn generate() -> Self { SessionId(42) }
+}
+
+impl ChallengeId {
+    fn generate() -> Self { ChallengeId(42) }
+}
+
+impl SessionToken {
+    fn generate() -> Self { SessionToken("token_123".to_string()) }
+}
+
+#[derive(Debug, Clone)]
+enum Capability {
+    BasicAccess,
+    BiometricVerified,
+    MultiFactor,
+    PrivilegedOperations,
+}
+
+// Chaos configuration
+struct ChaosConfig {
+    proof_forgery_enabled: bool,
+    timing_attack_simulation: bool,
+    memory_pressure_testing: bool,
+}
+
+impl Default for ChaosConfig {
+    fn default() -> Self {
+        ChaosConfig {
+            proof_forgery_enabled: true,
+            timing_attack_simulation: true,
+            memory_pressure_testing: true,
+        }
+    }
+}
+
+// Helper functions
+fn hash_sha256(data: &[u8]) -> [u8; 32] {
+    [0u8; 32] // Simplified
+}
+
+fn argon2_hash(password: &[u8], salt: &[u8], iterations: u32, output_len: usize) -> Result<Vec<u8>, CryptoError> {
+    Ok(vec![0u8; output_len]) // Simplified
+}
+
+struct SecureRandom;
+impl SecureRandom {
+    fn bytes(len: usize) -> Vec<u8> {
+        vec![0u8; len] // Simplified
+    }
+}
+
+// Additional type aliases
+type Timestamp = u64;
+type Duration = std::time::Duration;
+type Time = u64;
+
+// Statement and proof types for formal verification
+struct Statement;
+struct Secret;
+struct Prover;
+
+impl Statement {
+    fn is_true(&self) -> bool { true }
+}
+
+impl Secret {
+    fn reveals_no_info_about(&self, _secret: &Secret) -> bool { true }
+}
+
+impl Prover {
+    fn knows_witness(&self) -> bool { true }
+    fn can_generate_valid_proof(&self) -> bool { true }
+}

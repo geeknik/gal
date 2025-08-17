@@ -1,0 +1,242 @@
+// GAL Chaos Contracts Demo
+// This example demonstrates the chaos contracts and specifications framework
+// introduced in Phase 2.1
+
+@chaos_invariant("balance_consistency")
+actor BankAccount {
+    state balance: Int
+    state account_id: String
+    
+    // Invariants specified using annotations
+    invariant balance >= 0  // Balance must never be negative
+    invariant account_id.length() > 0  // Account ID must not be empty
+    
+    // Constructor
+    on Initialize(initial_balance: Int, id: String)
+        requires initial_balance >= 0
+        ensures self.balance == initial_balance
+        ensures self.account_id == id
+    =>
+        balance = initial_balance
+        account_id = id
+    
+    // Deposit operation with chaos testing
+    @chaos_test(
+        faults: [MessageDrop(0.1), NetworkDelay(100ms..500ms)],
+        property: "balance_increases_monotonically"
+    )
+    on Deposit(amount: Int)
+        requires amount > 0
+        ensures self.balance >= old(self.balance)
+    =>
+        atomic {
+            let old_balance = balance
+            balance += amount
+            
+            // Log transaction for audit
+            send(audit_service, TransactionLog {
+                account: account_id,
+                operation: "deposit",
+                amount: amount,
+                old_balance: old_balance,
+                new_balance: balance
+            })
+        }
+    
+    // Withdrawal with comprehensive error handling
+    on Withdraw(amount: Int) =>
+        if amount <= 0 {
+            reply(ErrorResponse("Amount must be positive"))
+        } else if amount > balance {
+            reply(ErrorResponse("Insufficient funds"))
+        } else {
+            atomic {
+                let old_balance = balance
+                balance -= amount
+                
+                send(audit_service, TransactionLog {
+                    account: account_id,
+                    operation: "withdraw", 
+                    amount: amount,
+                    old_balance: old_balance,
+                    new_balance: balance
+                })
+                
+                reply(WithdrawalSuccess(balance))
+            }
+        }
+    
+    // Transfer between accounts with fault tolerance
+    @chaos_test(
+        faults: [ActorCrash, MessageDrop(0.05), NetworkPartition(2s)],
+        property: "money_conservation"
+    )
+    on Transfer(target_account: ActorRef, amount: Int) =>
+        if amount <= 0 {
+            reply(ErrorResponse("Amount must be positive"))
+        } else if amount > balance {
+            reply(ErrorResponse("Insufficient funds"))  
+        } else {
+            // Two-phase commit for transfer
+            atomic {
+                // Phase 1: Prepare
+                balance -= amount
+                send(target_account, DepositPrepare(amount, self_ref()))
+                
+                // Wait for confirmation or timeout
+                receive {
+                    PrepareSuccess => {
+                        // Phase 2: Commit
+                        send(target_account, DepositCommit(amount))
+                        reply(TransferSuccess(balance))
+                    }
+                    PrepareFailed(reason) => {
+                        // Rollback
+                        balance += amount
+                        reply(ErrorResponse(reason))
+                    }
+                } timeout 5s => {
+                    // Rollback on timeout
+                    balance += amount
+                    reply(ErrorResponse("Transfer timeout"))
+                }
+            }
+        }
+    
+    on GetBalance => reply(balance)
+}
+
+// Supervisor with chaos-aware restart strategy
+@chaos_enabled
+supervisor AccountSupervisor {
+    strategy = ExponentialBackoff(
+        initial: 100ms,
+        max: 30s,
+        factor: 2.0,
+        max_restarts: 10
+    )
+    
+    // Chaos-aware supervision
+    on ActorFailed(actor_id, error) =>
+        if error.is_chaos_induced() {
+            // More lenient handling for chaos-induced failures
+            schedule_restart(actor_id, strategy.chaos_delay())
+        } else {
+            // Standard handling for genuine failures
+            if error.is_recoverable() {
+                schedule_restart(actor_id, strategy.next_delay())
+            } else {
+                escalate(error)
+            }
+        }
+}
+
+// Property-based test specification
+@chaos_property_test
+property bank_system_consistency {
+    given accounts: Vec<BankAccount> = arbitrary(3..10)
+    given operations: Vec<Operation> = arbitrary_operations(100)
+    
+    when {
+        // Apply operations under chaos conditions
+        chaos.apply_faults([
+            MessageDrop(0.1),
+            NetworkDelay(50ms..200ms),
+            ActorRestart(0.05)
+        ])
+        
+        for operation in operations {
+            operation.execute(accounts)
+        }
+        
+        chaos.wait_for_quiescence(timeout: 10s)
+    }
+    
+    then {
+        // System invariants must hold
+        total_money_conserved() &&
+        all_balances_non_negative() &&
+        audit_log_consistent() &&
+        no_money_created_or_destroyed()
+    }
+}
+
+// Fault injection specification
+@fault_spec
+fault_scenario network_issues {
+    pattern = Periodic {
+        fault_type: "network_partition",
+        period: 30s,
+        duration: 5s,
+        jitter: 2s
+    }
+    
+    scope = Network {
+        message_types: ["Transfer", "DepositPrepare"],
+        failure_rate: 0.2
+    }
+    
+    conditions = [
+        "system_load > 0.8",
+        "active_transfers > 10"
+    ]
+}
+
+// Main application with chaos testing
+@chaos_enabled
+app BankingSystem {
+    // System-wide invariants
+    invariant sum(all_accounts.balance) == total_system_money
+    invariant active_accounts.count() <= max_accounts
+    
+    on Start =>
+        // Initialize audit service
+        let audit_service = spawn AuditService("audit_log.json")
+        
+        // Create account supervisor
+        let supervisor = spawn AccountSupervisor
+        
+        // Create sample accounts
+        let account1 = spawn_supervised(supervisor, BankAccount(1000, "ACC-001"))
+        let account2 = spawn_supervised(supervisor, BankAccount(500, "ACC-002"))
+        let account3 = spawn_supervised(supervisor, BankAccount(750, "ACC-003"))
+        
+        // Run chaos tests
+        if chaos_testing_enabled() {
+            chaos.schedule_experiment(network_issues, duration: 60s)
+            chaos.run_property_test(bank_system_consistency)
+        }
+        
+        // Start transaction processing
+        process_transactions([account1, account2, account3])
+}
+
+// Example usage with explicit chaos contract
+@verify_contracts
+fn process_transactions(accounts: Vec<ActorRef>) {
+    // This function will be verified to maintain all registered invariants
+    
+    for account in accounts {
+        // Simulate random transactions
+        let operation = random_operation()
+        
+        match operation {
+            "deposit" => {
+                let amount = random_range(1, 1000)
+                send(account, Deposit(amount))
+            }
+            "withdraw" => {
+                let amount = random_range(1, 500)
+                send(account, Withdraw(amount))
+            }
+            "transfer" => {
+                let target = random_choice(accounts)
+                let amount = random_range(1, 300)
+                send(account, Transfer(target, amount))
+            }
+        }
+        
+        // Brief delay between operations
+        sleep(random_range(10ms, 100ms))
+    }
+}

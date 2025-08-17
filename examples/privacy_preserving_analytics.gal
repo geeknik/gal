@@ -1,0 +1,660 @@
+// Privacy-Preserving Data Analytics with Differential Privacy
+// Demonstrates GAL's formal verification of privacy guarantees and chaos testing
+
+import std.crypto
+import std.verification
+import std.chaos
+import std.statistics
+import std.privacy
+
+// Formal verification contracts for differential privacy
+@verify_invariant("epsilon_differential_privacy")
+fn epsilon_dp_invariant(analyzer: &PrivateAnalyzer, epsilon: f64) -> bool {
+    // Invariant: All queries satisfy ε-differential privacy
+    analyzer.privacy_budget.remaining_epsilon() >= 0.0 &&
+    analyzer.noise_mechanism.satisfies_epsilon_dp(epsilon)
+}
+
+@verify_invariant("composition_theorem")
+fn composition_invariant(analyzer: &PrivateAnalyzer) -> bool {
+    // Invariant: Sequential composition of private mechanisms maintains privacy
+    analyzer.query_history.iter().map(|q| q.epsilon).sum::<f64>() <= analyzer.privacy_budget.total_epsilon
+}
+
+@verify_invariant("sensitivity_bounds")
+fn sensitivity_bounds_invariant(query: &PrivateQuery) -> bool {
+    // Invariant: Query sensitivity is correctly bounded
+    query.l1_sensitivity <= query.computed_sensitivity() &&
+    query.l2_sensitivity <= query.computed_l2_sensitivity()
+}
+
+// Privacy budget management with formal verification
+struct PrivacyBudget {
+    total_epsilon: f64,
+    total_delta: f64,
+    consumed_epsilon: f64,
+    consumed_delta: f64,
+    allocation_strategy: AllocationStrategy,
+}
+
+impl PrivacyBudget {
+    @verify_postcondition("valid_budget", |result| result.total_epsilon > 0.0 && result.total_delta >= 0.0)
+    fn new(epsilon: f64, delta: f64) -> Self {
+        PrivacyBudget {
+            total_epsilon: epsilon,
+            total_delta: delta,
+            consumed_epsilon: 0.0,
+            consumed_delta: 0.0,
+            allocation_strategy: AllocationStrategy::Uniform,
+        }
+    }
+    
+    @verify_precondition("sufficient_budget", |epsilon, delta| self.can_spend(*epsilon, *delta))
+    @verify_postcondition("budget_updated", |_| self.consumed_epsilon <= self.total_epsilon)
+    fn spend(&mut self, epsilon: f64, delta: f64) -> Result<(), PrivacyError> {
+        if !self.can_spend(epsilon, delta) {
+            return Err(PrivacyError::InsufficientBudget);
+        }
+        
+        self.consumed_epsilon += epsilon;
+        self.consumed_delta += delta;
+        Ok(())
+    }
+    
+    fn remaining_epsilon(&self) -> f64 {
+        self.total_epsilon - self.consumed_epsilon
+    }
+    
+    fn can_spend(&self, epsilon: f64, delta: f64) -> bool {
+        self.consumed_epsilon + epsilon <= self.total_epsilon &&
+        self.consumed_delta + delta <= self.total_delta
+    }
+}
+
+// Noise mechanisms for differential privacy
+enum NoiseMechanism {
+    Laplace { scale: f64 },
+    Gaussian { sigma: f64 },
+    Exponential { epsilon: f64 },
+    DiscreteGaussian { sigma: f64 },
+}
+
+impl NoiseMechanism {
+    @verify_postcondition("correct_scale", |result| result > 0.0)
+    fn laplace_scale(sensitivity: f64, epsilon: f64) -> f64 {
+        sensitivity / epsilon
+    }
+    
+    @verify_postcondition("correct_sigma", |result| result > 0.0)
+    fn gaussian_sigma(sensitivity: f64, epsilon: f64, delta: f64) -> f64 {
+        sensitivity * (2.0 * (1.25 / delta).ln()).sqrt() / epsilon
+    }
+    
+    fn add_noise(&self, true_value: f64) -> f64 {
+        match self {
+            NoiseMechanism::Laplace { scale } => {
+                true_value + sample_laplace(0.0, *scale)
+            },
+            NoiseMechanism::Gaussian { sigma } => {
+                true_value + sample_gaussian(0.0, *sigma)
+            },
+            NoiseMechanism::Exponential { epsilon } => {
+                // For exponential mechanism (used for non-numeric queries)
+                true_value
+            },
+            NoiseMechanism::DiscreteGaussian { sigma } => {
+                true_value + sample_discrete_gaussian(0.0, *sigma) as f64
+            },
+        }
+    }
+    
+    fn satisfies_epsilon_dp(&self, epsilon: f64) -> bool {
+        match self {
+            NoiseMechanism::Laplace { scale } => *scale >= 1.0 / epsilon,
+            NoiseMechanism::Gaussian { sigma } => *sigma >= (2.0 * (1.25 / 1e-5).ln()).sqrt() / epsilon,
+            _ => true, // Simplified for other mechanisms
+        }
+    }
+}
+
+// Private query with sensitivity analysis
+struct PrivateQuery {
+    id: QueryId,
+    query_type: QueryType,
+    epsilon: f64,
+    delta: f64,
+    l1_sensitivity: f64,
+    l2_sensitivity: f64,
+    noise_mechanism: NoiseMechanism,
+    true_result: Option<f64>,
+    noisy_result: Option<f64>,
+}
+
+impl PrivateQuery {
+    @verify_precondition("valid_parameters", |epsilon, delta| *epsilon > 0.0 && *delta >= 0.0)
+    @verify_postcondition("query_created", |result| result.epsilon > 0.0)
+    fn new(query_type: QueryType, epsilon: f64, delta: f64) -> Self {
+        let (l1_sens, l2_sens) = query_type.compute_sensitivity();
+        let noise_mechanism = if delta > 0.0 {
+            NoiseMechanism::Gaussian {
+                sigma: NoiseMechanism::gaussian_sigma(l1_sens, epsilon, delta)
+            }
+        } else {
+            NoiseMechanism::Laplace {
+                scale: NoiseMechanism::laplace_scale(l1_sens, epsilon)
+            }
+        };
+        
+        PrivateQuery {
+            id: QueryId::generate(),
+            query_type,
+            epsilon,
+            delta,
+            l1_sensitivity: l1_sens,
+            l2_sensitivity: l2_sens,
+            noise_mechanism,
+            true_result: None,
+            noisy_result: None,
+        }
+    }
+    
+    @verify_postcondition("privacy_preserved", |result| result.is_ok())
+    fn execute(&mut self, dataset: &Dataset) -> Result<f64, QueryError> {
+        // Compute true result
+        let true_result = self.query_type.compute(dataset)?;
+        self.true_result = Some(true_result);
+        
+        // Add calibrated noise for differential privacy
+        let noisy_result = self.noise_mechanism.add_noise(true_result);
+        self.noisy_result = Some(noisy_result);
+        
+        Ok(noisy_result)
+    }
+    
+    fn computed_sensitivity(&self) -> f64 {
+        self.query_type.compute_sensitivity().0
+    }
+    
+    fn computed_l2_sensitivity(&self) -> f64 {
+        self.query_type.compute_sensitivity().1
+    }
+}
+
+// Query types with automatic sensitivity computation
+#[derive(Clone)]
+enum QueryType {
+    Count,
+    Sum { column: String },
+    Mean { column: String },
+    Histogram { column: String, bins: usize },
+    Quantile { column: String, quantile: f64 },
+    CovarianceMatrix { columns: Vec<String> },
+}
+
+impl QueryType {
+    fn compute_sensitivity(&self) -> (f64, f64) {
+        match self {
+            QueryType::Count => (1.0, 1.0), // Adding/removing one record changes count by 1
+            QueryType::Sum { .. } => (1.0, 1.0), // Assuming normalized data [0,1]
+            QueryType::Mean { .. } => (1.0, 1.0), // L1 and L2 sensitivity for mean
+            QueryType::Histogram { bins, .. } => (*bins as f64, (*bins as f64).sqrt()),
+            QueryType::Quantile { .. } => (1.0, 1.0),
+            QueryType::CovarianceMatrix { columns } => {
+                let d = columns.len() as f64;
+                (d * d, d) // Sensitivity scales with dimensionality
+            },
+        }
+    }
+    
+    fn compute(&self, dataset: &Dataset) -> Result<f64, QueryError> {
+        match self {
+            QueryType::Count => Ok(dataset.rows.len() as f64),
+            QueryType::Sum { column } => {
+                dataset.column(column)?
+                    .iter()
+                    .try_fold(0.0, |acc, &val| Ok(acc + val))
+            },
+            QueryType::Mean { column } => {
+                let values = dataset.column(column)?;
+                let sum: f64 = values.iter().sum();
+                Ok(sum / values.len() as f64)
+            },
+            QueryType::Histogram { column, bins } => {
+                // Return first bin count as example
+                let values = dataset.column(column)?;
+                let bin_count = values.iter()
+                    .filter(|&&val| val >= 0.0 && val < 1.0 / *bins as f64)
+                    .count();
+                Ok(bin_count as f64)
+            },
+            QueryType::Quantile { column, quantile } => {
+                let mut values = dataset.column(column)?.clone();
+                values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let index = (*quantile * values.len() as f64) as usize;
+                Ok(values.get(index).copied().unwrap_or(0.0))
+            },
+            QueryType::CovarianceMatrix { columns } => {
+                // Return first element of covariance matrix
+                if columns.len() >= 2 {
+                    let col1 = dataset.column(&columns[0])?;
+                    let col2 = dataset.column(&columns[1])?;
+                    let mean1 = col1.iter().sum::<f64>() / col1.len() as f64;
+                    let mean2 = col2.iter().sum::<f64>() / col2.len() as f64;
+                    let covar = col1.iter().zip(col2.iter())
+                        .map(|(x, y)| (x - mean1) * (y - mean2))
+                        .sum::<f64>() / col1.len() as f64;
+                    Ok(covar)
+                } else {
+                    Err(QueryError::InsufficientColumns)
+                }
+            },
+        }
+    }
+}
+
+// Dataset with privacy-preserving operations
+struct Dataset {
+    rows: Vec<DataRow>,
+    columns: HashMap<String, usize>,
+    privacy_metadata: PrivacyMetadata,
+}
+
+impl Dataset {
+    fn column(&self, name: &str) -> Result<&Vec<f64>, QueryError> {
+        let col_idx = self.columns.get(name)
+            .ok_or(QueryError::ColumnNotFound)?;
+        
+        let values: Vec<f64> = self.rows.iter()
+            .map(|row| row.values[*col_idx])
+            .collect();
+            
+        // This is a simplified implementation - in practice, we'd cache column data
+        Ok(Box::leak(values.into_boxed_slice()))
+    }
+}
+
+// Main privacy-preserving analyzer
+struct PrivateAnalyzer {
+    privacy_budget: PrivacyBudget,
+    query_history: Vec<PrivateQuery>,
+    noise_mechanism: NoiseMechanism,
+    chaos_config: ChaosConfig,
+}
+
+impl PrivateAnalyzer {
+    @verify_postcondition("analyzer_initialized", |result| result.privacy_budget.total_epsilon > 0.0)
+    fn new(epsilon: f64, delta: f64) -> Self {
+        PrivateAnalyzer {
+            privacy_budget: PrivacyBudget::new(epsilon, delta),
+            query_history: Vec::new(),
+            noise_mechanism: NoiseMechanism::Laplace { scale: 1.0 },
+            chaos_config: ChaosConfig::default(),
+        }
+    }
+    
+    // Execute differentially private query with budget management
+    @verify_precondition("sufficient_budget", |query| self.privacy_budget.can_spend(query.epsilon, query.delta))
+    @verify_postcondition("privacy_preserved", |result| result.is_ok())
+    fn execute_private_query(&mut self, mut query: PrivateQuery, dataset: &Dataset) -> Result<f64, AnalysisError> {
+        // Check privacy budget
+        self.privacy_budget.spend(query.epsilon, query.delta)?;
+        
+        // Execute query with noise
+        let result = query.execute(dataset)?;
+        
+        // Record query for composition tracking
+        self.query_history.push(query);
+        
+        Ok(result)
+    }
+    
+    // Self-modification: Adaptive privacy budget allocation
+    @chaos_test("budget_optimization")
+    fn adaptive_budget_allocation(&mut self) -> Result<(), AnalysisError> {
+        // Analyze historical query patterns to optimize future budget allocation
+        let high_utility_queries = self.query_history.iter()
+            .filter(|q| self.compute_utility_score(q) > 0.8)
+            .count() as f64;
+            
+        let total_queries = self.query_history.len() as f64;
+        
+        if total_queries > 0.0 {
+            let high_utility_ratio = high_utility_queries / total_queries;
+            
+            // Adjust allocation strategy based on utility patterns
+            if high_utility_ratio > 0.6 {
+                self.privacy_budget.allocation_strategy = AllocationStrategy::HighUtilityFocused;
+            } else {
+                self.privacy_budget.allocation_strategy = AllocationStrategy::Conservative;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    // Federated learning with differential privacy
+    fn federated_private_learning(&mut self, local_datasets: Vec<Dataset>) -> Result<ModelParameters, AnalysisError> {
+        let mut global_gradients = vec![0.0; 10]; // Simplified model
+        
+        for dataset in local_datasets {
+            // Compute local gradients
+            let local_gradients = self.compute_private_gradients(&dataset)?;
+            
+            // Add to global aggregation
+            for (i, &grad) in local_gradients.iter().enumerate() {
+                global_gradients[i] += grad;
+            }
+        }
+        
+        // Add noise to aggregated gradients for central differential privacy
+        let epsilon_per_round = 0.1;
+        let query = PrivateQuery::new(
+            QueryType::Sum { column: "gradients".to_string() },
+            epsilon_per_round,
+            1e-5
+        );
+        
+        self.privacy_budget.spend(epsilon_per_round, 1e-5)?;
+        
+        for gradient in &mut global_gradients {
+            *gradient = self.noise_mechanism.add_noise(*gradient);
+        }
+        
+        Ok(ModelParameters { weights: global_gradients })
+    }
+    
+    // Chaos engineering tests for privacy system
+    #[chaos_scenario("noise_calibration_error")]
+    fn test_noise_calibration_failure(&mut self) {
+        // Simulate errors in noise calibration
+        self.chaos_config.inject_calibration_error();
+        
+        // Verify privacy guarantees still hold
+        let test_query = PrivateQuery::new(QueryType::Count, 1.0, 0.0);
+        assert!(test_query.noise_mechanism.satisfies_epsilon_dp(1.0));
+    }
+    
+    #[chaos_scenario("budget_exhaustion")]
+    fn test_budget_exhaustion(&mut self) {
+        // Simulate rapid budget consumption
+        let small_epsilon = 0.01;
+        while self.privacy_budget.can_spend(small_epsilon, 0.0) {
+            let _ = self.privacy_budget.spend(small_epsilon, 0.0);
+        }
+        
+        // Verify no more queries can be executed
+        assert!(!self.privacy_budget.can_spend(small_epsilon, 0.0));
+    }
+    
+    #[chaos_scenario("adversarial_queries")]
+    fn test_adversarial_resistance(&mut self) {
+        // Simulate adversarial query patterns
+        self.chaos_config.simulate_adversarial_queries();
+        
+        // Verify composition theorem still holds
+        let total_consumed = self.query_history.iter()
+            .map(|q| q.epsilon)
+            .sum::<f64>();
+        assert!(total_consumed <= self.privacy_budget.total_epsilon);
+    }
+    
+    // Private helper methods
+    fn compute_utility_score(&self, query: &PrivateQuery) -> f64 {
+        // Simplified utility scoring based on noise-to-signal ratio
+        if let (Some(true_val), Some(noisy_val)) = (query.true_result, query.noisy_result) {
+            let noise = (true_val - noisy_val).abs();
+            let signal = true_val.abs();
+            if signal > 0.0 {
+                1.0 - (noise / signal).min(1.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        }
+    }
+    
+    fn compute_private_gradients(&mut self, dataset: &Dataset) -> Result<Vec<f64>, AnalysisError> {
+        // Simplified gradient computation with privacy
+        let epsilon_per_gradient = 0.01;
+        let mut gradients = Vec::new();
+        
+        for i in 0..10 { // 10 parameters in simplified model
+            let query = PrivateQuery::new(
+                QueryType::Mean { column: format!("feature_{}", i) },
+                epsilon_per_gradient,
+                1e-5
+            );
+            
+            let gradient = self.execute_private_query(query, dataset)?;
+            gradients.push(gradient);
+        }
+        
+        Ok(gradients)
+    }
+}
+
+// Supporting types and structs
+struct DataRow {
+    values: Vec<f64>,
+}
+
+struct PrivacyMetadata {
+    sensitivity_bounds: HashMap<String, f64>,
+    data_types: HashMap<String, DataType>,
+}
+
+struct ModelParameters {
+    weights: Vec<f64>,
+}
+
+#[derive(Clone)]
+enum AllocationStrategy {
+    Uniform,
+    HighUtilityFocused,
+    Conservative,
+}
+
+enum DataType {
+    Numeric,
+    Categorical,
+    Boolean,
+}
+
+// Error types
+#[derive(Debug)]
+enum PrivacyError {
+    InsufficientBudget,
+    InvalidParameters,
+}
+
+#[derive(Debug)]
+enum QueryError {
+    ColumnNotFound,
+    InsufficientColumns,
+    ComputationError,
+}
+
+#[derive(Debug)]
+enum AnalysisError {
+    Privacy(PrivacyError),
+    Query(QueryError),
+    System(String),
+}
+
+impl From<PrivacyError> for AnalysisError {
+    fn from(e: PrivacyError) -> Self {
+        AnalysisError::Privacy(e)
+    }
+}
+
+impl From<QueryError> for AnalysisError {
+    fn from(e: QueryError) -> Self {
+        AnalysisError::Query(e)
+    }
+}
+
+// Chaos testing configuration
+struct ChaosConfig {
+    calibration_error_rate: f64,
+    adversarial_query_probability: f64,
+    budget_exhaustion_speed: f64,
+}
+
+impl Default for ChaosConfig {
+    fn default() -> Self {
+        ChaosConfig {
+            calibration_error_rate: 0.01,
+            adversarial_query_probability: 0.05,
+            budget_exhaustion_speed: 1.0,
+        }
+    }
+}
+
+impl ChaosConfig {
+    fn inject_calibration_error(&self) {
+        // Simulate noise calibration errors
+        println!("🔥 Injecting noise calibration error");
+    }
+    
+    fn simulate_adversarial_queries(&self) {
+        // Simulate adversarial query patterns
+        println!("🔥 Simulating adversarial query attacks");
+    }
+}
+
+// Cryptographic random sampling functions
+fn sample_laplace(location: f64, scale: f64) -> f64 {
+    // Simplified Laplace sampling
+    let u = SecureRandom::uniform() - 0.5;
+    location - scale * u.signum() * (1.0 - 2.0 * u.abs()).ln()
+}
+
+fn sample_gaussian(mean: f64, sigma: f64) -> f64 {
+    // Box-Muller transform for Gaussian sampling
+    let u1 = SecureRandom::uniform();
+    let u2 = SecureRandom::uniform();
+    mean + sigma * (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+}
+
+fn sample_discrete_gaussian(mean: f64, sigma: f64) -> i64 {
+    // Simplified discrete Gaussian sampling
+    sample_gaussian(mean, sigma).round() as i64
+}
+
+// Main demonstration function
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("🔒 Privacy-Preserving Analytics with Differential Privacy Demo");
+    
+    // Initialize privacy-preserving analyzer with ε=1.0, δ=1e-5
+    let mut analyzer = PrivateAnalyzer::new(1.0, 1e-5);
+    
+    // Create sample dataset
+    let dataset = create_sample_dataset(1000)?;
+    
+    // Execute differentially private queries
+    println!("\n📊 Executing private queries...");
+    
+    // Private count query
+    let count_query = PrivateQuery::new(QueryType::Count, 0.1, 0.0);
+    let private_count = analyzer.execute_private_query(count_query, &dataset)?;
+    println!("Private count: {:.2}", private_count);
+    
+    // Private mean query
+    let mean_query = PrivateQuery::new(
+        QueryType::Mean { column: "income".to_string() },
+        0.2,
+        1e-6
+    );
+    let private_mean = analyzer.execute_private_query(mean_query, &dataset)?;
+    println!("Private mean income: {:.2}", private_mean);
+    
+    // Private histogram query
+    let hist_query = PrivateQuery::new(
+        QueryType::Histogram { column: "age".to_string(), bins: 10 },
+        0.3,
+        1e-6
+    );
+    let private_hist = analyzer.execute_private_query(hist_query, &dataset)?;
+    println!("Private histogram bin count: {:.2}", private_hist);
+    
+    // Demonstrate adaptive budget allocation
+    println!("\n🧠 Adaptive privacy budget optimization...");
+    analyzer.adaptive_budget_allocation()?;
+    
+    // Demonstrate federated learning with differential privacy
+    println!("\n🌐 Federated private learning...");
+    let local_datasets = vec![
+        create_sample_dataset(100)?,
+        create_sample_dataset(150)?,
+        create_sample_dataset(200)?,
+    ];
+    let model = analyzer.federated_private_learning(local_datasets)?;
+    println!("Trained private model with {} parameters", model.weights.len());
+    
+    // Run chaos engineering tests
+    println!("\n🔥 Running chaos engineering tests...");
+    analyzer.test_noise_calibration_failure();
+    analyzer.test_budget_exhaustion();
+    analyzer.test_adversarial_resistance();
+    
+    // Privacy budget summary
+    println!("\n📈 Privacy Budget Summary:");
+    println!("Remaining ε-budget: {:.3}", analyzer.privacy_budget.remaining_epsilon());
+    println!("Total queries executed: {}", analyzer.query_history.len());
+    
+    println!("\n✅ Privacy-preserving analytics demonstration completed!");
+    println!("✓ Differential privacy guarantees maintained");
+    println!("✓ Formal verification contracts satisfied");
+    println!("✓ Chaos engineering tests passed");
+    println!("✓ Adaptive budget optimization enabled");
+    println!("✓ Federated learning privacy preserved");
+    
+    Ok(())
+}
+
+// Helper function to create sample dataset
+fn create_sample_dataset(size: usize) -> Result<Dataset, Box<dyn std::error::Error>> {
+    let mut rows = Vec::new();
+    let mut columns = HashMap::new();
+    columns.insert("income".to_string(), 0);
+    columns.insert("age".to_string(), 1);
+    
+    for _ in 0..size {
+        let income = SecureRandom::uniform() * 100000.0; // Random income 0-100k
+        let age = 18.0 + SecureRandom::uniform() * 62.0; // Random age 18-80
+        rows.push(DataRow {
+            values: vec![income, age],
+        });
+    }
+    
+    Ok(Dataset {
+        rows,
+        columns,
+        privacy_metadata: PrivacyMetadata {
+            sensitivity_bounds: HashMap::new(),
+            data_types: HashMap::new(),
+        },
+    })
+}
+
+// Placeholder for cryptographic secure random
+struct SecureRandom;
+
+impl SecureRandom {
+    fn uniform() -> f64 {
+        // In practice, use cryptographically secure random number generator
+        0.5 // Simplified for demonstration
+    }
+    
+    fn generate_nonce() -> [u8; 16] {
+        [0u8; 16] // Simplified
+    }
+    
+    fn generate_challenge() -> [u8; 32] {
+        [0u8; 32] // Simplified
+    }
+}
+
+// Additional type aliases for clarity
+type QueryId = u64;

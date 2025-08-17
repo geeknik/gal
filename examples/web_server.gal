@@ -1,0 +1,610 @@
+// Web Server with Routing and Middleware
+// Demonstrates: actor-based request handling, routing, middleware pipeline
+
+use stdlib::*
+
+// HTTP request and response types
+type HttpRequest = {
+    method: String,
+    path: String,
+    headers: HashMap<String, String>,
+    body: String,
+    params: HashMap<String, String>,
+    query: HashMap<String, String>
+}
+
+type HttpResponse = {
+    status: Int,
+    headers: HashMap<String, String>,
+    body: String
+}
+
+// Middleware function type
+type Middleware = fun(HttpRequest, HttpResponse) -> (HttpRequest, HttpResponse)
+
+// Route handler actor
+actor RouteHandler {
+    state routes: HashMap<String, ActorRef>
+    state middleware_pipeline: Array<Middleware>
+    state not_found_handler: ActorRef
+    
+    new create() {
+        routes = HashMap::new()
+        middleware_pipeline = []
+        not_found_handler = spawn NotFoundHandler()
+    }
+    
+    // Register a route
+    on RegisterRoute(method: String, path: String, handler: ActorRef) {
+        let route_key = method + ":" + path
+        routes.put(route_key, handler)
+        reply(Ok("Route registered: " + route_key))
+    }
+    
+    // Add middleware to the pipeline
+    on AddMiddleware(middleware: Middleware) {
+        middleware_pipeline.push(middleware)
+        reply(Ok("Middleware added"))
+    }
+    
+    // Handle incoming HTTP request
+    on HandleRequest(request: HttpRequest) {
+        // Apply middleware pipeline
+        let processed_req = request
+        let initial_response = HttpResponse {
+            status: 200,
+            headers: HashMap::new(),
+            body: ""
+        }
+        
+        // Process through middleware
+        let (final_req, middleware_resp) = apply_middleware(processed_req, initial_response)
+        
+        // Find matching route
+        let route_key = final_req.method + ":" + extract_route_pattern(final_req.path)
+        
+        if routes.contains(route_key) {
+            let handler = routes.get(route_key)
+            let response = ask(handler, ProcessRequest(final_req)) timeout 5s
+            reply(response)
+        } else {
+            let response = ask(not_found_handler, ProcessRequest(final_req)) timeout 1s
+            reply(response)
+        }
+    }
+    
+    fun apply_middleware(req: HttpRequest, resp: HttpResponse) -> (HttpRequest, HttpResponse) {
+        let current_req = req
+        let current_resp = resp
+        
+        for middleware in middleware_pipeline {
+            let (new_req, new_resp) = middleware(current_req, current_resp)
+            current_req = new_req
+            current_resp = new_resp
+        }
+        
+        return (current_req, current_resp)
+    }
+    
+    fun extract_route_pattern(path: String) -> String {
+        // Simplified route pattern extraction
+        // In production, would handle path parameters properly
+        return path.split("?")[0]
+    }
+}
+
+// Static file server
+actor StaticFileServer {
+    state root_dir: String
+    state cache: HashMap<String, String>
+    state max_cache_size: Int
+    
+    new create(root: String) {
+        root_dir = root
+        cache = HashMap::new()
+        max_cache_size = 100
+    }
+    
+    on ProcessRequest(request: HttpRequest) {
+        let file_path = root_dir + request.path
+        
+        // Check cache first
+        if cache.contains(file_path) {
+            let content = cache.get(file_path)
+            reply(HttpResponse {
+                status: 200,
+                headers: get_content_headers(file_path),
+                body: content
+            })
+        } else {
+            // Read file from disk
+            try {
+                let content = io::read_file(file_path)
+                
+                // Add to cache if small enough
+                if content.length() < 1000000 && cache.size() < max_cache_size {
+                    cache.put(file_path, content)
+                }
+                
+                reply(HttpResponse {
+                    status: 200,
+                    headers: get_content_headers(file_path),
+                    body: content
+                })
+            } catch FileNotFoundError {
+                reply(HttpResponse {
+                    status: 404,
+                    headers: HashMap::new(),
+                    body: "File not found"
+                })
+            }
+        }
+    }
+    
+    fun get_content_headers(path: String) -> HashMap<String, String> {
+        let headers = HashMap::new()
+        
+        if path.ends_with(".html") {
+            headers.put("Content-Type", "text/html")
+        } else if path.ends_with(".css") {
+            headers.put("Content-Type", "text/css")
+        } else if path.ends_with(".js") {
+            headers.put("Content-Type", "application/javascript")
+        } else if path.ends_with(".json") {
+            headers.put("Content-Type", "application/json")
+        } else {
+            headers.put("Content-Type", "text/plain")
+        }
+        
+        return headers
+    }
+}
+
+// API endpoint handlers
+actor UserHandler {
+    state users: HashMap<String, User>
+    state next_id: Int
+    
+    type User = {
+        id: String,
+        name: String,
+        email: String,
+        created_at: Int
+    }
+    
+    new create() {
+        users = HashMap::new()
+        next_id = 1
+        
+        // Add some sample users
+        add_sample_users()
+    }
+    
+    fun add_sample_users() {
+        let user1 = User {
+            id: "1",
+            name: "Alice",
+            email: "alice@example.com",
+            created_at: time::now()
+        }
+        users.put("1", user1)
+        
+        let user2 = User {
+            id: "2",
+            name: "Bob",
+            email: "bob@example.com",
+            created_at: time::now()
+        }
+        users.put("2", user2)
+        next_id = 3
+    }
+    
+    on ProcessRequest(request: HttpRequest) {
+        match request.method {
+            "GET" => handle_get(request),
+            "POST" => handle_post(request),
+            "PUT" => handle_put(request),
+            "DELETE" => handle_delete(request),
+            _ => reply(HttpResponse {
+                status: 405,
+                headers: HashMap::new(),
+                body: "Method not allowed"
+            })
+        }
+    }
+    
+    fun handle_get(request: HttpRequest) {
+        if request.params.contains("id") {
+            let user_id = request.params.get("id")
+            if users.contains(user_id) {
+                let user = users.get(user_id)
+                reply(HttpResponse {
+                    status: 200,
+                    headers: json_headers(),
+                    body: user_to_json(user)
+                })
+            } else {
+                reply(HttpResponse {
+                    status: 404,
+                    headers: json_headers(),
+                    body: "{\"error\": \"User not found\"}"
+                })
+            }
+        } else {
+            // Return all users
+            let all_users = users_to_json_array(users.values())
+            reply(HttpResponse {
+                status: 200,
+                headers: json_headers(),
+                body: all_users
+            })
+        }
+    }
+    
+    fun handle_post(request: HttpRequest) {
+        // Parse user from request body (simplified)
+        let user_data = parse_json_user(request.body)
+        let new_user = User {
+            id: next_id.to_string(),
+            name: user_data.name,
+            email: user_data.email,
+            created_at: time::now()
+        }
+        
+        users.put(new_user.id, new_user)
+        next_id = next_id + 1
+        
+        reply(HttpResponse {
+            status: 201,
+            headers: json_headers(),
+            body: user_to_json(new_user)
+        })
+    }
+    
+    fun handle_put(request: HttpRequest) {
+        if request.params.contains("id") {
+            let user_id = request.params.get("id")
+            if users.contains(user_id) {
+                let user_data = parse_json_user(request.body)
+                let updated_user = User {
+                    id: user_id,
+                    name: user_data.name,
+                    email: user_data.email,
+                    created_at: users.get(user_id).created_at
+                }
+                
+                users.put(user_id, updated_user)
+                
+                reply(HttpResponse {
+                    status: 200,
+                    headers: json_headers(),
+                    body: user_to_json(updated_user)
+                })
+            } else {
+                reply(HttpResponse {
+                    status: 404,
+                    headers: json_headers(),
+                    body: "{\"error\": \"User not found\"}"
+                })
+            }
+        } else {
+            reply(HttpResponse {
+                status: 400,
+                headers: json_headers(),
+                body: "{\"error\": \"User ID required\"}"
+            })
+        }
+    }
+    
+    fun handle_delete(request: HttpRequest) {
+        if request.params.contains("id") {
+            let user_id = request.params.get("id")
+            if users.contains(user_id) {
+                users.remove(user_id)
+                reply(HttpResponse {
+                    status: 204,
+                    headers: HashMap::new(),
+                    body: ""
+                })
+            } else {
+                reply(HttpResponse {
+                    status: 404,
+                    headers: json_headers(),
+                    body: "{\"error\": \"User not found\"}"
+                })
+            }
+        } else {
+            reply(HttpResponse {
+                status: 400,
+                headers: json_headers(),
+                body: "{\"error\": \"User ID required\"}"
+            })
+        }
+    }
+    
+    fun json_headers() -> HashMap<String, String> {
+        let headers = HashMap::new()
+        headers.put("Content-Type", "application/json")
+        return headers
+    }
+    
+    fun user_to_json(user: User) -> String {
+        return "{\"id\": \"" + user.id + "\", \"name\": \"" + user.name + 
+               "\", \"email\": \"" + user.email + "\", \"created_at\": " + 
+               user.created_at.to_string() + "}"
+    }
+    
+    fun users_to_json_array(users: Array<User>) -> String {
+        let json = "["
+        for i in 0..users.length() {
+            if i > 0 {
+                json = json + ", "
+            }
+            json = json + user_to_json(users[i])
+        }
+        json = json + "]"
+        return json
+    }
+    
+    fun parse_json_user(json: String) -> {name: String, email: String} {
+        // Simplified JSON parsing
+        return {name: "Parsed User", email: "parsed@example.com"}
+    }
+}
+
+// 404 handler
+actor NotFoundHandler {
+    on ProcessRequest(request: HttpRequest) {
+        reply(HttpResponse {
+            status: 404,
+            headers: HashMap::new(),
+            body: "404 - Page not found: " + request.path
+        })
+    }
+}
+
+// WebSocket handler for real-time features
+actor WebSocketHandler {
+    state connections: HashMap<String, ActorRef>
+    state rooms: HashMap<String, Array<String>>
+    
+    new create() {
+        connections = HashMap::new()
+        rooms = HashMap::new()
+    }
+    
+    on Connect(client_id: String, client: ActorRef) {
+        connections.put(client_id, client)
+        reply(Ok("Connected"))
+    }
+    
+    on Disconnect(client_id: String) {
+        connections.remove(client_id)
+        // Remove from all rooms
+        for room_name in rooms.keys() {
+            leave_room(client_id, room_name)
+        }
+        reply(Ok("Disconnected"))
+    }
+    
+    on JoinRoom(client_id: String, room: String) {
+        if !rooms.contains(room) {
+            rooms.put(room, [])
+        }
+        let room_members = rooms.get(room)
+        room_members.push(client_id)
+        rooms.put(room, room_members)
+        
+        // Notify other members
+        broadcast_to_room(room, client_id + " joined the room", client_id)
+        reply(Ok("Joined room: " + room))
+    }
+    
+    on LeaveRoom(client_id: String, room: String) {
+        leave_room(client_id, room)
+        broadcast_to_room(room, client_id + " left the room", client_id)
+        reply(Ok("Left room: " + room))
+    }
+    
+    on Broadcast(client_id: String, room: String, message: String) {
+        broadcast_to_room(room, message, client_id)
+        reply(Ok("Message sent"))
+    }
+    
+    fun leave_room(client_id: String, room: String) {
+        if rooms.contains(room) {
+            let members = rooms.get(room)
+            let new_members = members.filter(|id| id != client_id)
+            rooms.put(room, new_members)
+        }
+    }
+    
+    fun broadcast_to_room(room: String, message: String, sender_id: String) {
+        if rooms.contains(room) {
+            let members = rooms.get(room)
+            for member_id in members {
+                if member_id != sender_id && connections.contains(member_id) {
+                    let client = connections.get(member_id)
+                    send(client, WebSocketMessage(message))
+                }
+            }
+        }
+    }
+}
+
+// Main HTTP server actor
+actor HttpServer {
+    state port: Int
+    state router: ActorRef
+    state static_server: ActorRef
+    state websocket_handler: ActorRef
+    state request_count: Int
+    state start_time: Int
+    
+    invariant port > 0 && port < 65536
+    
+    new create(server_port: Int) {
+        port = server_port
+        router = spawn RouteHandler()
+        static_server = spawn StaticFileServer("/public")
+        websocket_handler = spawn WebSocketHandler()
+        request_count = 0
+        start_time = time::now()
+        
+        setup_routes()
+        setup_middleware()
+        
+        println("HTTP Server started on port " + port.to_string())
+    }
+    
+    fun setup_routes() {
+        // API routes
+        let user_handler = spawn UserHandler()
+        send(router, RegisterRoute("GET", "/api/users", user_handler))
+        send(router, RegisterRoute("POST", "/api/users", user_handler))
+        send(router, RegisterRoute("PUT", "/api/users/:id", user_handler))
+        send(router, RegisterRoute("DELETE", "/api/users/:id", user_handler))
+        
+        // Static file routes
+        send(router, RegisterRoute("GET", "/static/*", static_server))
+        
+        // Health check
+        let health_handler = spawn HealthCheckHandler(self)
+        send(router, RegisterRoute("GET", "/health", health_handler))
+    }
+    
+    fun setup_middleware() {
+        // Logging middleware
+        let logging_middleware = fun(req: HttpRequest, resp: HttpResponse) -> (HttpRequest, HttpResponse) {
+            println("[" + time::now().to_string() + "] " + req.method + " " + req.path)
+            return (req, resp)
+        }
+        send(router, AddMiddleware(logging_middleware))
+        
+        // CORS middleware
+        let cors_middleware = fun(req: HttpRequest, resp: HttpResponse) -> (HttpRequest, HttpResponse) {
+            resp.headers.put("Access-Control-Allow-Origin", "*")
+            resp.headers.put("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+            return (req, resp)
+        }
+        send(router, AddMiddleware(cors_middleware))
+    }
+    
+    on HandleConnection(connection: ActorRef) {
+        request_count = request_count + 1
+        
+        // Read request from connection
+        let request = ask(connection, ReadRequest()) timeout 5s
+        
+        // Process request through router
+        let response = ask(router, HandleRequest(request)) timeout 10s
+        
+        // Send response back
+        send(connection, SendResponse(response))
+    }
+    
+    on GetStats() {
+        let uptime = time::now() - start_time
+        reply({
+            port: port,
+            request_count: request_count,
+            uptime_seconds: uptime / 1000,
+            requests_per_second: request_count * 1000 / uptime
+        })
+    }
+}
+
+// Health check handler
+actor HealthCheckHandler {
+    state server: ActorRef
+    
+    new create(server_ref: ActorRef) {
+        server = server_ref
+    }
+    
+    on ProcessRequest(request: HttpRequest) {
+        let stats = ask(server, GetStats()) timeout 1s
+        reply(HttpResponse {
+            status: 200,
+            headers: json_headers(),
+            body: "{\"status\": \"healthy\", \"stats\": " + stats.to_string() + "}"
+        })
+    }
+    
+    fun json_headers() -> HashMap<String, String> {
+        let headers = HashMap::new()
+        headers.put("Content-Type", "application/json")
+        return headers
+    }
+}
+
+// Main entry point
+actor Main {
+    new create() {
+        println("Starting GAL Web Server Example")
+        
+        // Create HTTP server on port 8080
+        let server = spawn HttpServer(8080)
+        
+        // Simulate incoming connections
+        for i in 0..10 {
+            let mock_connection = spawn MockConnection(i)
+            send(server, HandleConnection(mock_connection))
+            time::sleep(100ms)
+        }
+        
+        // Get server statistics
+        time::sleep(2s)
+        let stats = ask(server, GetStats()) timeout 1s
+        println("Server stats: " + stats.to_string())
+        
+        println("Web server example completed")
+    }
+}
+
+// Mock connection for testing
+actor MockConnection {
+    state id: Int
+    
+    new create(conn_id: Int) {
+        id = conn_id
+    }
+    
+    on ReadRequest() {
+        // Simulate different types of requests
+        let req = if id % 3 == 0 {
+            HttpRequest {
+                method: "GET",
+                path: "/api/users",
+                headers: HashMap::new(),
+                body: "",
+                params: HashMap::new(),
+                query: HashMap::new()
+            }
+        } else if id % 3 == 1 {
+            HttpRequest {
+                method: "POST",
+                path: "/api/users",
+                headers: HashMap::new(),
+                body: "{\"name\": \"Test User\", \"email\": \"test@example.com\"}",
+                params: HashMap::new(),
+                query: HashMap::new()
+            }
+        } else {
+            HttpRequest {
+                method: "GET",
+                path: "/health",
+                headers: HashMap::new(),
+                body: "",
+                params: HashMap::new(),
+                query: HashMap::new()
+            }
+        }
+        reply(req)
+    }
+    
+    on SendResponse(response: HttpResponse) {
+        println("Connection " + id.to_string() + " received response: " + 
+                response.status.to_string() + " - " + response.body.substring(0, 50))
+    }
+}

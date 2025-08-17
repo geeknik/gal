@@ -1,0 +1,54 @@
+// hello_actor.gal - First GAL program demonstrating actors
+
+// Define a simple greeter actor
+actor Greeter {
+    state greeting: String
+    state count: Int
+    
+    // Constructor
+    new create(msg: String) {
+        greeting = msg
+        count = 0
+    }
+    
+    // Message handlers
+    on Greet(name: String) {
+        count = count + 1
+        println(greeting + ", " + name + "!")
+        println("Greeted " + count + " times")
+        reply(Ok("Greeting sent"))
+    }
+    
+    on GetCount {
+        reply(count)
+    }
+    
+    on Reset {
+        count = 0
+        reply(Ok("Counter reset"))
+    }
+}
+
+// Main actor - entry point
+actor Main {
+    new create() {
+        // Spawn a greeter actor
+        let greeter = spawn Greeter("Hello")
+        
+        // Send some messages
+        send(greeter, Greet("World"))
+        send(greeter, Greet("GAL"))
+        send(greeter, Greet("Actors"))
+        
+        // Get the count
+        let count = ask(greeter, GetCount) timeout 1s
+        println("Total greetings: " + count)
+        
+        // Reset
+        send(greeter, Reset)
+        
+        // Verify reset
+        let new_count = ask(greeter, GetCount) timeout 1s
+        println("Count after reset: " + new_count)
+    }
+}
