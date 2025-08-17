@@ -260,13 +260,6 @@ cargo test --all
 cargo test --features chaos-mode
 ```
 
-## 📖 Learn More
-
-- **[Tutorial](https://gal-lang.org/tutorial)** - Step-by-step guide
-- **[Blog](https://gal-lang.org/blog)** - Articles and updates
-- **[Papers](docs/papers/)** - Academic publications
-- **[Community](https://discord.gg/gal-lang)** - Join our Discord
-
 ## 🏢 Production Users
 
 GAL is ready for production use in:
